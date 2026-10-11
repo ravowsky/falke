@@ -106,7 +106,7 @@ impl Timeline {
             .find(|t| *t > time + KEYFRAME_EPSILON)
     }
 
-    /// Where a new keyframe goes when the playhead is at `time`. 
+    /// Where a new keyframe goes when the playhead is at `time`.
     pub fn free_time_at(&self, time: f32) -> f32 {
         let mut t = time;
         while self
@@ -332,7 +332,7 @@ impl RecordingSession {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum CameraMode {
     /// You fly the camera, and the authored keyframe path moves it during
     /// playback. The camera the replay was shot with is ignored.
@@ -441,6 +441,11 @@ impl UiSystem {
             self.camera_mode = CameraMode::Freecam;
         }
 
+        // Where playback mode is not a choice, it is not state either.
+        if self.playback_mode_is_implied() {
+            self.playback.mode_active = true;
+        }
+
         self.playback.advance();
 
         if (self.playback.time - self.last_seen_time).abs() > f32::EPSILON {
@@ -496,7 +501,7 @@ impl UiSystem {
                 // `frame` is only Some in playback mode, which gates this.
                 CameraMode::Pov => frame.as_ref().and_then(|f| f.camera),
                 CameraMode::Freecam => {
-                    if self.playback.mode_active || self.playback.playing {
+                    if self.playback.mode_active {
                         self.timeline.path.sample(self.playback.time, skater)
                     } else {
                         None
@@ -556,6 +561,12 @@ impl UiSystem {
             .map(|f| f.time)
             .unwrap_or(0.0);
         replay_end.max(path_end)
+    }
+
+    /// Is playback mode forced on rather than being the user's to pick?
+    fn playback_mode_is_implied(&self) -> bool {
+        self.loaded_replay.is_some()
+            && matches!(self.camera_mode, CameraMode::Pov | CameraMode::Orbit)
     }
 
     /// The fov the orbit rig flies at.
@@ -1091,13 +1102,21 @@ impl UiSystem {
 
                 ui.separator();
 
-                if ui
-                    .checkbox(&mut self.playback.mode_active, "Playback mode")
-                    .changed()
-                    && !self.playback.mode_active
-                {
-                    self.playback.playing = false;
-                }
+                // Shown checked and locked in the modes that imply it, so the
+                // one control that can stop a replay dead is never a mystery.
+                let implied = self.playback_mode_is_implied();
+                ui.add_enabled_ui(!implied, |ui| {
+                    if ui
+                        .checkbox(&mut self.playback.mode_active, "Playback mode")
+                        .on_disabled_hover_text(
+                            "Always on in this mode: it has no camera of its own                              without the replay running.",
+                        )
+                        .changed()
+                        && !self.playback.mode_active
+                    {
+                        self.playback.playing = false;
+                    }
+                });
 
                 let prev_key = self.timeline.time_before(self.playback.time);
                 if ui
@@ -1583,6 +1602,32 @@ mod tests {
 
         assert_eq!(timeline.key_at(1.0), Some(0));
         assert_eq!(timeline.path.len(), 2);
+    }
+
+    /// POV has no camera without the replay running and Orbit has nothing to
+    /// pivot on, so with one loaded neither mode leaves playback mode to the
+    /// user. Freecam authors against the level, so there it stays a choice.
+    #[test]
+    fn playback_mode_is_only_a_choice_in_freecam() {
+        let mut ui = UiSystem::default();
+
+        for mode in [CameraMode::Freecam, CameraMode::Pov, CameraMode::Orbit] {
+            ui.camera_mode = mode;
+            assert!(!ui.playback_mode_is_implied(), "{mode:?} with no replay");
+        }
+
+        ui.loaded_replay = Some(LoadedReplay {
+            name: "test".into(),
+            frame_count: 0,
+            frames: Vec::new(),
+        });
+
+        ui.camera_mode = CameraMode::Freecam;
+        assert!(!ui.playback_mode_is_implied());
+        ui.camera_mode = CameraMode::Pov;
+        assert!(ui.playback_mode_is_implied());
+        ui.camera_mode = CameraMode::Orbit;
+        assert!(ui.playback_mode_is_implied());
     }
 
     #[test]

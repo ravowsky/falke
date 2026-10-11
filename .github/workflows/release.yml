@@ -19,7 +19,11 @@ jobs:
       VERSION: ${{ github.event.inputs.version || github.ref_name }}
 
     steps:
+      # Full history and tags: build.rs runs vergen's all_git, which needs
+      # the commit count and `git describe` as well as the SHA.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Nightly, because retour's thiscall-abi feature gates on a nightly
       # feature attribute. The DLL is 32-bit, matching the games.
