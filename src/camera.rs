@@ -12,6 +12,19 @@ pub struct CameraPose {
 }
 
 impl CameraPose {
+    /// Used to check wether camera is dirty.
+    pub fn approx_eq(&self, other: &Self) -> bool {
+        const POSITION: f32 = 0.05;
+        /// Quaternion alignment; sign is ignored, q and -q are one rotation.
+        const ALIGNMENT: f32 = 0.9999;
+
+        let a: glm::Quat = self.orientation.into();
+        let b: glm::Quat = other.orientation.into();
+        (glm::Vec3::from(self.position) - glm::Vec3::from(other.position)).norm() <= POSITION
+            && glm::quat_dot(&a, &b).abs() >= ALIGNMENT
+            && fov_approx_eq(self.fov, other.fov)
+    }
+
     /// Blend two poses: lerp the position and fov, slerp the rotation.
     pub fn lerp(a: &Self, b: &Self, t: f32) -> Self {
         Self {
@@ -20,6 +33,11 @@ impl CameraPose {
             fov: lerp(a.fov, b.fov, t),
         }
     }
+}
+
+/// Wether fov is dirty.
+pub fn fov_approx_eq(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 0.05
 }
 
 /// A camera pose pinned to a point in time, plus how tightly the spline through
@@ -108,6 +126,37 @@ impl CameraPath {
     pub fn sample(&self, time: f32, skater: Option<Vec3>) -> Option<CameraPose> {
         sample_frames(&self.frames, time, skater)
     }
+
+    /// The interpolated orbit at `time`.
+    pub fn orbit_at(&self, time: f32) -> Option<OrbitCamera> {
+        let (keys, t) = segment(&self.frames, time)?;
+        interpolate_orbit(keys, t)
+    }
+}
+
+/// The four keys shaping the segment `time` falls in.
+fn segment(frames: &[Keyframe], time: f32) -> Option<([&Keyframe; 4], f32)> {
+    let len = frames.len();
+    if len < 2 || time > frames[len - 1].time {
+        return None;
+    }
+
+    let i2 = frames.partition_point(|f| f.time < time).clamp(1, len - 1);
+    let i1 = i2 - 1;
+    let f1 = &frames[i1];
+    let f2 = &frames[i2];
+    let f0 = if i1 > 0 { &frames[i1 - 1] } else { f1 };
+    let f3 = if i2 + 1 < len { &frames[i2 + 1] } else { f2 };
+
+    // A zero-length span has nothing to cross: two keys on one time, which
+    // `Timeline::free_time_at` keeps `➕ Add` from making.
+    let span = f2.time - f1.time;
+    let t = if span > f32::EPSILON {
+        ((time - f1.time) / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Some(([f0, f1, f2, f3], t))
 }
 
 fn sample_frames(frames: &[Keyframe], time: f32, skater: Option<Vec3>) -> Option<CameraPose> {
@@ -126,20 +175,8 @@ fn sample_frames(frames: &[Keyframe], time: f32, skater: Option<Vec3>) -> Option
         return None;
     }
 
-    let i2 = frames.partition_point(|f| f.time < time).max(1);
-    let i1 = i2 - 1;
-
-    let f0 = if i1 > 0 { &frames[i1 - 1] } else { &frames[i1] };
-    let f1 = &frames[i1];
-    let f2 = &frames[i2];
-    let f3 = if i2 + 1 < len {
-        &frames[i2 + 1]
-    } else {
-        &frames[i2]
-    };
-
-    let t = (time - f1.time) / (f2.time - f1.time);
-    let keys = [f0, f1, f2, f3];
+    let (keys, t) = segment(frames, time)?;
+    let [_, f1, f2, _] = keys;
 
     if let Some(pose) = sample_orbit(keys, t, skater) {
         return Some(pose);
@@ -175,6 +212,13 @@ fn sample_frames(frames: &[Keyframe], time: f32, skater: Option<Vec3>) -> Option
 /// with the same pivot. Yaw is not wrapped, so a key at 0° and one at 720°
 /// spin twice round the target.
 fn sample_orbit(keys: [&Keyframe; 4], t: f32, skater: Option<Vec3>) -> Option<CameraPose> {
+    let orbit = interpolate_orbit(keys, t)?;
+    let fov = lerp(keys[1].pose.fov, keys[2].pose.fov, t);
+    Some(orbit.pose_around(orbit.pivot(skater), fov))
+}
+
+/// The orbit itself, where both ends of the segment are orbit keys.
+fn interpolate_orbit(keys: [&Keyframe; 4], t: f32) -> Option<OrbitCamera> {
     let (k1, k2) = (keys[1].orbit?, keys[2].orbit?);
 
     // A neighbour outside the orbit run acts like the end of the path.
@@ -191,14 +235,13 @@ fn sample_orbit(keys: [&Keyframe; 4], t: f32, skater: Option<Vec3>) -> Option<Ca
     let spline =
         |field: fn(&OrbitCamera) -> f32| hermite(orbits.map(|o| field(&o)), times, t, tension);
     let targets = orbits.map(|o| glm::Vec3::from(o.target));
-    let orbit = OrbitCamera {
+    Some(OrbitCamera {
         target: hermite(targets, times, t, tension).into(),
         yaw: spline(|o| o.yaw),
         pitch: spline(|o| o.pitch).clamp(-MAX_PITCH, MAX_PITCH),
         distance: spline(|o| o.distance).max(OrbitCamera::MIN_DISTANCE),
-    };
-    let fov = lerp(keys[1].pose.fov, keys[2].pose.fov, t);
-    Some(orbit.pose_around(orbit.pivot(skater), fov))
+        aim_height: spline(|o| o.aim_height),
+    })
 }
 
 /// Cubic Hermite through `p[1]..p[2]`, with `p[0]` and `p[3]` shaping the
@@ -305,10 +348,16 @@ pub struct OrbitCamera {
     /// Radians above the horizon.
     pub pitch: f32,
     pub distance: f32,
+    /// How far above the skater the pivot sits, for the keys that follow one.
+    /// The recorded position is the root bone, which is between the feet, so
+    /// without this every orbit aims at the floor.
+    pub aim_height: f32,
 }
 
 impl OrbitCamera {
     pub const MIN_DISTANCE: f32 = 10.0;
+
+    pub const DEFAULT_AIM_HEIGHT: f32 = 40.0;
 
     /// Start orbiting whatever `pose` is looking at, `distance` ahead of it,
     /// without moving the camera.
@@ -321,7 +370,14 @@ impl OrbitCamera {
             yaw: offset.x.atan2(offset.z),
             pitch: (offset.y / distance).clamp(-1.0, 1.0).asin(),
             distance,
+            aim_height: Self::DEFAULT_AIM_HEIGHT,
         }
+    }
+
+    /// Keep an existing aim height across a rebuild from a pose.
+    pub fn with_aim_height(mut self, aim_height: f32) -> Self {
+        self.aim_height = aim_height;
+        self
     }
 
     /// From the target to the eye.
@@ -333,7 +389,10 @@ impl OrbitCamera {
 
     /// What the camera circles.
     pub fn pivot(&self, skater: Option<Vec3>) -> Vec3 {
-        skater.unwrap_or(self.target)
+        match skater {
+            Some(skater) => Vec3::new(skater.x, skater.y + self.aim_height, skater.z),
+            None => self.target,
+        }
     }
 
     /// Where the camera sits and looks when orbiting `target`, which may
@@ -346,6 +405,18 @@ impl OrbitCamera {
             orientation: look_rotation(&-offset),
             fov,
         }
+    }
+
+    /// Close enough that the camera would land in the same place.
+    pub fn approx_eq(&self, other: &Self) -> bool {
+        const ANGLE: f32 = 1e-3;
+        const LENGTH: f32 = 0.05;
+
+        (self.yaw - other.yaw).abs() <= ANGLE
+            && (self.pitch - other.pitch).abs() <= ANGLE
+            && (self.distance - other.distance).abs() <= LENGTH
+            && (self.aim_height - other.aim_height).abs() <= LENGTH
+            && (glm::Vec3::from(self.target) - glm::Vec3::from(other.target)).norm() <= LENGTH
     }
 
     pub fn rotate(&mut self, d_yaw: f32, d_pitch: f32) {
@@ -405,6 +476,7 @@ mod tests {
             yaw,
             pitch: 0.0,
             distance: 100.0,
+            aim_height: OrbitCamera::DEFAULT_AIM_HEIGHT,
         };
         Keyframe {
             time,
@@ -450,10 +522,133 @@ mod tests {
         path.push(orbit_kf(0.0, 0.0));
         path.push(orbit_kf(1.0, 1.0));
         let skater = Vec3::new(500.0, 20.0, -300.0);
+        let pivot = Vec3::new(
+            skater.x,
+            skater.y + OrbitCamera::DEFAULT_AIM_HEIGHT,
+            skater.z,
+        );
         for t in [0.0, 0.3, 1.0] {
             let pose = path.sample(t, Some(skater)).unwrap();
-            assert!((radius(pose, skater) - 100.0).abs() < 1e-2, "t={t}");
+            assert!((radius(pose, pivot) - 100.0).abs() < 1e-2, "t={t}");
+            assert!(radius(pose, skater) > 100.0, "t={t} orbits above the feet");
         }
+    }
+
+    /// `aim_height` is a keyframe's own value, so a run of keys can lift the
+    /// pivot over time, and a change to it counts as a change.
+    #[test]
+    fn aim_height_interpolates_along_a_run() {
+        let (mut low, mut high) = (orbit_kf(0.0, 0.0), orbit_kf(1.0, 0.0));
+        low.orbit.as_mut().unwrap().aim_height = 0.0;
+        high.orbit.as_mut().unwrap().aim_height = 100.0;
+        let mut path = CameraPath::new();
+        path.push(low);
+        path.push(high);
+
+        let mid = path.orbit_at(0.5).expect("an orbit run");
+        assert!(mid.aim_height > 0.0 && mid.aim_height < 100.0);
+
+        let skater = Some(Vec3::ZERO);
+        let start = path.sample(0.0, skater).unwrap().position.y;
+        assert!(path.sample(0.5, skater).unwrap().position.y > start);
+
+        let rig = path.orbit_at(0.0).unwrap();
+        let lifted = OrbitCamera {
+            aim_height: rig.aim_height + 10.0,
+            ..rig
+        };
+        assert!(!rig.approx_eq(&lifted));
+    }
+
+    /// The staleness indicator leans on these: a pose that went through a
+    /// quaternion and back must still count as unchanged, or every keyframe
+    /// would read as moved-off the moment it was stamped.
+    #[test]
+    fn approx_eq_ignores_noise_but_not_movement() {
+        let a = pose(0.0);
+        assert!(a.approx_eq(&a));
+
+        let mut jittered = a;
+        jittered.position = Vec3::new(0.001, 0.0, 0.0);
+        jittered.fov += 0.01;
+        assert!(a.approx_eq(&jittered));
+
+        let mut moved = a;
+        moved.position = Vec3::new(5.0, 0.0, 0.0);
+        assert!(!a.approx_eq(&moved));
+
+        let mut zoomed = a;
+        zoomed.fov += 5.0;
+        assert!(!a.approx_eq(&zoomed));
+
+        // q and -q are the same rotation.
+        let mut negated = a;
+        let q: Quat = a.orientation;
+        negated.orientation = Quat(-q.0, -q.1, -q.2, -q.3);
+        assert!(a.approx_eq(&negated));
+
+        let orbit = OrbitCamera {
+            target: Vec3::ZERO,
+            yaw: 1.0,
+            pitch: 0.2,
+            distance: 100.0,
+            aim_height: OrbitCamera::DEFAULT_AIM_HEIGHT,
+        };
+        assert!(orbit.approx_eq(&orbit));
+        let mut turned = orbit;
+        turned.yaw += 0.2;
+        assert!(!orbit.approx_eq(&turned));
+        let mut pulled = orbit;
+        pulled.distance += 10.0;
+        assert!(!orbit.approx_eq(&pulled));
+    }
+
+    /// `orbit_at` is what holds a live rig on the pose the path is showing, so
+    /// it has to agree with `sample` - same keys, same `t`.
+    #[test]
+    fn orbit_at_agrees_with_the_sampled_pose() {
+        let mut path = CameraPath::new();
+        path.push(orbit_kf(0.0, 0.0));
+        path.push(orbit_kf(1.0, 1.0));
+
+        let rig = path.orbit_at(0.5).expect("a run of orbit keys");
+        assert!(rig.yaw > 0.0 && rig.yaw < 1.0);
+
+        let sampled = path.sample(0.5, None).expect("a pose");
+        let from_rig = rig.pose_around(rig.pivot(None), sampled.fov);
+        assert!(
+            (glm::Vec3::from(sampled.position) - glm::Vec3::from(from_rig.position)).norm() < 1e-4
+        );
+
+        // Past the end there is nothing to hold onto, as with `sample`.
+        assert!(path.orbit_at(2.0).is_none());
+        assert!(path.sample(2.0, None).is_none());
+    }
+
+    /// A path of plain keys has no orbit to report, which is what tells the UI
+    /// to leave the rig alone.
+    #[test]
+    fn orbit_at_is_none_for_world_space_keys() {
+        let mut path = CameraPath::new();
+        path.push(kf(0.0, 0.0));
+        path.push(kf(1.0, 100.0));
+
+        assert!(path.sample(0.5, None).is_some());
+        assert!(path.orbit_at(0.5).is_none());
+    }
+
+    /// Two keys stamped at one time are not a path: there is no span to
+    /// interpolate across, so everything after that time samples to `None`.
+    /// `Timeline::free_time_at` exists to keep `➕ Add` from building one.
+    #[test]
+    fn keys_at_one_time_have_no_span() {
+        let mut path = CameraPath::new();
+        path.push(kf(1.0, 0.0));
+        path.push(kf(1.0, 50.0));
+
+        assert!(path.sample(1.0, None).is_some());
+        assert!(path.sample(1.5, None).is_none());
+        assert!(path.sample(2.0, None).is_none());
     }
 
     #[test]
@@ -463,6 +658,7 @@ mod tests {
             yaw: 0.1,
             pitch: 0.0,
             distance: 100.0,
+            aim_height: OrbitCamera::DEFAULT_AIM_HEIGHT,
         };
         let near = orbit.with_yaw_near(4.0 * std::f32::consts::PI);
         assert!((near.yaw - (0.1 + 4.0 * std::f32::consts::PI)).abs() < 1e-4);
@@ -568,6 +764,7 @@ mod tests {
             yaw: 0.0,
             pitch: 0.2,
             distance: 100.0,
+            aim_height: OrbitCamera::DEFAULT_AIM_HEIGHT,
         };
         orbit.rotate(2.0, 5.0);
         let eye: glm::Vec3 = orbit.pose_around(orbit.target, 90.0).position.into();

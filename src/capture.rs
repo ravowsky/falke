@@ -53,8 +53,11 @@ pub unsafe fn on_endscene(playback: Option<&ReplayState>) {
     }
 }
 
+/// How often a recording frame is logged.
+const LOG_EVERY_FRAMES: u64 = 60;
+
 fn log_frame(replay: &Replay, frame: &ReplayState) {
-    if !log::log_enabled!(log::Level::Debug) {
+    if !log::log_enabled!(log::Level::Debug) || replay.frame_count() % LOG_EVERY_FRAMES != 0 {
         return;
     }
     let pos_str = frame

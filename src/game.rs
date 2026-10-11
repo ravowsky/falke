@@ -21,12 +21,21 @@ pub trait Game: Sync {
     /// True while the game is in its free-flying camera state.
     fn in_freecam(&self) -> bool;
 
+    /// Whether this game can record and play back replays at all.
+    fn is_replay_available(&self) -> bool;
+
     /// The pose of the camera the user flies, or `None` before the backend has
     /// found one.
     fn camera(&self) -> Option<CameraPose>;
 
     /// Push a pose into the camera the user flies. No-op if there is none yet.
     fn set_camera(&self, pose: &CameraPose);
+
+    /// The field of view, in degrees.
+    fn fov(&self) -> f32;
+
+    /// Set the field of view, in degrees.
+    fn set_fov(&self, fov: f32);
 }
 
 static GAME: OnceLock<&'static dyn Game> = OnceLock::new();
@@ -63,6 +72,11 @@ pub fn in_freecam() -> bool {
     current().is_some_and(|g| g.in_freecam())
 }
 
+/// Whether the detected game can record and play back replays.
+pub fn is_replay_available() -> bool {
+    current().is_some_and(|g| g.is_replay_available())
+}
+
 /// The pose of the camera the user flies, or `None` if there is none yet.
 pub fn camera() -> Option<CameraPose> {
     current().and_then(|g| g.camera())
@@ -72,5 +86,17 @@ pub fn camera() -> Option<CameraPose> {
 pub fn set_camera(pose: &CameraPose) {
     if let Some(g) = current() {
         g.set_camera(pose);
+    }
+}
+
+/// The current field of view in degrees, or `None` before `init()` has run.
+pub fn fov() -> Option<f32> {
+    current().map(|g| g.fov())
+}
+
+/// Set the field of view, in degrees.
+pub fn set_fov(fov: f32) {
+    if let Some(g) = current() {
+        g.set_fov(fov);
     }
 }

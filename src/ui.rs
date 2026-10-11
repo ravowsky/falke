@@ -1,15 +1,17 @@
 use egui::{
-    Align2, Color32, Context as eguiContext, DragValue, FontId, Pos2, Rect, Sense, TopBottomPanel,
-    Vec2,
+    Align2, Color32, Context as eguiContext, CursorIcon, DragValue, FontId, Id, LayerId, Order,
+    Pos2, Rect, Sense, Shape, Stroke, TopBottomPanel, Vec2,
 };
 use std::{
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Instant,
 };
-use windows::Win32::UI::WindowsAndMessaging::ShowCursor;
 
 use crate::{
-    camera::{CameraPath, CameraPose, Keyframe, OrbitCamera},
+    camera::{CameraPath, CameraPose, Keyframe, OrbitCamera, fov_approx_eq},
     capture,
     falke::version_string,
     game,
@@ -24,6 +26,15 @@ const MIN_VISIBLE_DURATION: f32 = 0.5;
 
 /// Fov for a pose built before the game has told us what the camera uses.
 const DEFAULT_FOV: f32 = 90.0;
+
+/// A selected keyframe the camera has since moved off.
+const STALE_KEY_COLOR: Color32 = Color32::from_rgb(255, 95, 95);
+
+/// How close two keyframe times have to be to count as the same time.
+const KEYFRAME_EPSILON: f32 = 1e-3;
+
+/// How far a new keyframe steps on when the playhead's time is taken.
+const KEYFRAME_SPACING: f32 = 1.0;
 
 /// How far ahead of the camera the orbit pivot lands when orbit mode starts.
 const DEFAULT_ORBIT_DISTANCE: f32 = 300.0;
@@ -41,6 +52,7 @@ const ORBIT_ZOOM_SPEED: f32 = 0.002;
 /// Owns the camera path and timeline viewport state.
 pub struct Timeline {
     pub path: CameraPath,
+    /// The keyframe the playhead is on.
     pub selected_index: Option<usize>,
     pub dragging_index: Option<usize>,
     pub total_duration: f32,
@@ -62,42 +74,63 @@ impl Default for Timeline {
 }
 
 impl Timeline {
-    /// Add a keyframe, sort the path, and select the last frame.
+    /// Add a keyframe.
     pub fn add_keyframe(&mut self, kf: Keyframe) {
         self.path.push(kf);
-        self.selected_index = Some(self.path.len() - 1);
     }
 
-    /// Delete the currently selected keyframe.
+    /// The keyframe the playhead is on, if it is on one.
+    pub fn key_at(&self, time: f32) -> Option<usize> {
+        self.path
+            .frames()
+            .iter()
+            .position(|f| (f.time - time).abs() < KEYFRAME_EPSILON)
+    }
+
+    /// The time of the nearest keyframe before `time`.
+    pub fn time_before(&self, time: f32) -> Option<f32> {
+        self.path
+            .frames()
+            .iter()
+            .rev()
+            .map(|f| f.time)
+            .find(|t| *t < time - KEYFRAME_EPSILON)
+    }
+
+    /// The time of the nearest keyframe after `time`.
+    pub fn time_after(&self, time: f32) -> Option<f32> {
+        self.path
+            .frames()
+            .iter()
+            .map(|f| f.time)
+            .find(|t| *t > time + KEYFRAME_EPSILON)
+    }
+
+    /// Where a new keyframe goes when the playhead is at `time`. 
+    pub fn free_time_at(&self, time: f32) -> f32 {
+        let mut t = time;
+        while self
+            .path
+            .frames()
+            .iter()
+            .any(|f| (f.time - t).abs() < KEYFRAME_EPSILON)
+        {
+            t += KEYFRAME_SPACING;
+        }
+        t
+    }
+
+    /// Delete the keyframe the playhead is on.
     pub fn delete_selected(&mut self) {
         if let Some(i) = self.selected_index.take() {
             self.path.remove(i);
-            if !self.path.is_empty() {
-                self.selected_index = Some(self.path.len() - 1);
-            }
         }
     }
 
-    /// Re-sort the path while preserving the selected frame by value.
+    /// Re-sort the path. Nothing to preserve across it: selection is derived
+    /// from the playhead, not from an index into this list.
     pub fn sort(&mut self) {
-        let selected_kf = self.selected_index.and_then(|i| self.path.get(i).cloned());
         self.path.sort();
-        if let Some(kf) = selected_kf {
-            self.selected_index = self.path.frames().iter().position(|x| *x == kf);
-        }
-    }
-
-    /// Move selection to `index` and return the keyframe's time (for playhead sync).
-    /// Returns `None` if the index is out of bounds.
-    pub fn select(&mut self, index: usize) -> Option<f32> {
-        if index < self.path.len() {
-            self.selected_index = Some(index);
-            let time = self.path.frames()[index].time;
-            self.scroll_to(time);
-            Some(time)
-        } else {
-            None
-        }
     }
 
     /// Back to a pristine timeline: no path, default length and zoom.
@@ -327,15 +360,25 @@ impl CameraMode {
     }
 }
 
-/// Where the camera aims when following the skater in a replay frame. The
-/// recorded position is the root bone, so `aim_height` lifts it off the feet.
-fn skater_target(frame: Option<&ReplayState>, aim_height: f32) -> Option<Vec3> {
+/// The skater in a replay frame, as recorded: the root bone.
+fn skater_position(frame: Option<&ReplayState>) -> Option<Vec3> {
     let pos = frame?.skaters.first()?.world_pos;
-    Some(Vec3::new(pos[0], pos[1] + aim_height, pos[2]))
+    Some(Vec3::new(pos[0], pos[1], pos[2]))
 }
 
 pub struct UiSystem {
     pub is_showing: bool,
+    /// Was the panel on screen last frame? Only used to spot the frame it
+    /// opens on, so focus can be cleared then.
+    pub was_showing: bool,
+    /// Orbit mode only: is the camera the rig's or the path's?
+    rig_owns_camera: bool,
+    /// `playback.time` as `update` last left it, so a playhead that moved from
+    /// anywhere else can be recognised as a scrub.
+    last_seen_time: f32,
+    /// The fov the game had when freecam was entered, held for as long as we
+    /// are in it. `Some` means we are in freecam and owe the game its fov back.
+    pub entry_fov: Option<f32>,
     pub timeline: Timeline,
     pub playback: PlaybackController,
     pub recording: RecordingSession,
@@ -343,7 +386,6 @@ pub struct UiSystem {
     pub load_name: String,
     pub camera_mode: CameraMode,
     pub orbit: OrbitCamera,
-    pub aim_height: f32,
     last_logged_frame: usize,
 }
 
@@ -351,6 +393,10 @@ impl Default for UiSystem {
     fn default() -> Self {
         Self {
             is_showing: true,
+            was_showing: false,
+            rig_owns_camera: true,
+            last_seen_time: 0.0,
+            entry_fov: None,
             timeline: Timeline::default(),
             playback: PlaybackController::default(),
             recording: RecordingSession::default(),
@@ -362,8 +408,8 @@ impl Default for UiSystem {
                 yaw: 0.0,
                 pitch: 0.3,
                 distance: DEFAULT_ORBIT_DISTANCE,
+                aim_height: OrbitCamera::DEFAULT_AIM_HEIGHT,
             },
-            aim_height: 40.0,
             last_logged_frame: usize::MAX,
         }
     }
@@ -379,13 +425,34 @@ impl UiSystem {
             return;
         }
         self.is_showing = !self.is_showing;
-        unsafe { ShowCursor(self.is_showing) };
     }
 
     /// Per-frame update: advance time, apply the interpolated camera pose, and
     /// return the replay frame to draw this tick, if any.
     pub fn update(&mut self) -> Option<ReplayState> {
+        // Take the player's fov before anything below can write one.
+        if game::in_freecam() && self.entry_fov.is_none() {
+            self.entry_fov = game::fov();
+        }
+
+        // POV plays back the camera a replay was shot with, so it cannot
+        // outlive the replay: unloading one drops the mode with it.
+        if self.camera_mode == CameraMode::Pov && self.loaded_replay.is_none() {
+            self.camera_mode = CameraMode::Freecam;
+        }
+
         self.playback.advance();
+
+        if (self.playback.time - self.last_seen_time).abs() > f32::EPSILON {
+            self.rig_owns_camera = false;
+        }
+        self.last_seen_time = self.playback.time;
+
+        let previously_selected = self.timeline.selected_index;
+        self.timeline.selected_index = self.timeline.key_at(self.playback.time);
+        if self.timeline.selected_index != previously_selected {
+            self.load_selected_orbit();
+        }
 
         let end_time = self.playback_end_time();
 
@@ -423,14 +490,8 @@ impl UiSystem {
         };
 
         // Camera
-        // Recording is not handled here, the capture pass samples the camera
-        // itself, so the replay frame stays self-contained.
-        //
-        // The two sources are mutually exclusive on purpose. Both write the same
-        // camera object every frame, so running them together means whichever
-        // wrote last wins and neither looks right.
-        if !capture::is_recording() {
-            let skater = skater_target(frame.as_ref(), self.aim_height);
+        if !capture::is_recording() && game::in_freecam() {
+            let skater = skater_position(frame.as_ref());
             let pose: Option<CameraPose> = match self.camera_mode {
                 // `frame` is only Some in playback mode, which gates this.
                 CameraMode::Pov => frame.as_ref().and_then(|f| f.camera),
@@ -441,17 +502,28 @@ impl UiSystem {
                         None
                     }
                 }
-                // Playing runs the path, orbit keys included; paused hands the
-                // camera back to the mouse so keys can be placed.
-                CameraMode::Orbit => self
-                    .playback
-                    .playing
-                    .then(|| self.timeline.path.sample(self.playback.time, skater))
-                    .flatten()
-                    .or_else(|| {
-                        let fov = game::camera().map_or(DEFAULT_FOV, |c| c.fov);
-                        Some(self.orbit.pose_around(self.orbit.pivot(skater), fov))
-                    }),
+                // The path runs while it is being played or scrubbed, the rig
+                // runs while it is being flown. See `rig_owns_camera`.
+                CameraMode::Orbit => {
+                    let path_driving = self.playback.mode_active
+                        && (self.playback.playing || !self.rig_owns_camera);
+                    let from_path = path_driving
+                        .then(|| self.timeline.path.sample(self.playback.time, skater))
+                        .flatten();
+
+                    match from_path {
+                        Some(pose) => {
+                            if let Some(orbit) = self.timeline.path.orbit_at(self.playback.time) {
+                                self.orbit = orbit;
+                            }
+                            Some(pose)
+                        }
+                        None => Some(
+                            self.orbit
+                                .pose_around(self.orbit.pivot(skater), self.rig_fov()),
+                        ),
+                    }
+                }
             };
             if let Some(pose) = pose {
                 game::set_camera(&pose);
@@ -461,6 +533,8 @@ impl UiSystem {
         // Stop playing when we reach the end of all content.
         if self.playback.playing && end_time > 0.0 && self.playback.time >= end_time {
             self.playback.playing = false;
+            // Make sure we end on the actual end keyframe.
+            self.playback.time = end_time;
             log::debug!("[playback] reached end ({:.2}s), stopping", end_time);
         }
 
@@ -484,13 +558,81 @@ impl UiSystem {
         replay_end.max(path_end)
     }
 
+    /// The fov the orbit rig flies at.
+    fn rig_fov(&self) -> f32 {
+        self.timeline
+            .selected_index
+            .and_then(|i| self.timeline.path.get(i))
+            .map(|k| k.pose.fov)
+            .or_else(|| game::camera().map(|c| c.fov))
+            .unwrap_or(DEFAULT_FOV)
+    }
+
     /// Pivot the orbit around whatever the camera is looking at, so entering
     /// orbit mode does not jump the view.
     fn recentre_orbit(&mut self) {
         if let Some(pose) = game::camera() {
-            self.orbit =
-                OrbitCamera::from_pose(&pose, DEFAULT_ORBIT_DISTANCE).with_yaw_near(self.orbit.yaw);
+            self.orbit = OrbitCamera::from_pose(&pose, DEFAULT_ORBIT_DISTANCE)
+                .with_yaw_near(self.orbit.yaw)
+                .with_aim_height(self.orbit.aim_height);
         }
+    }
+
+    fn apply_would_change_selected(&self) -> bool {
+        if self.camera_mode == CameraMode::Pov {
+            return false;
+        }
+        let Some(kf) = self
+            .timeline
+            .selected_index
+            .and_then(|i| self.timeline.path.get(i))
+        else {
+            return false;
+        };
+        let Some(live) = game::camera() else {
+            return false;
+        };
+
+        match (kf.orbit, self.orbit_for_new_keyframe()) {
+            (Some(stored), Some(rig)) => {
+                !stored.approx_eq(&rig) || !fov_approx_eq(kf.pose.fov, live.fov)
+            }
+            (None, None) => !kf.pose.approx_eq(&live),
+            _ => true,
+        }
+    }
+
+    /// Apply the camera to the selected keyframe.
+    fn apply_camera_to_selected(&mut self) {
+        let Some(i) = self.timeline.selected_index else {
+            return;
+        };
+        let Some(pose) = game::camera() else {
+            return;
+        };
+        let orbit = self.orbit_for_new_keyframe();
+        if let Some(kf) = self.timeline.path.get_mut(i) {
+            kf.pose = pose;
+            kf.orbit = orbit;
+        }
+    }
+
+    /// Resets the camera to the selected keyframe data.
+    fn reset_camera_to_selected(&mut self) {
+        let Some(kf) = self
+            .timeline
+            .selected_index
+            .and_then(|i| self.timeline.path.get(i))
+            .cloned()
+        else {
+            return;
+        };
+
+        if let Some(orbit) = kf.orbit {
+            self.orbit = orbit;
+        }
+        self.rig_owns_camera = false;
+        game::set_camera(&kf.resolve(None));
     }
 
     /// What a keyframe placed now should remember of the orbit, if anything.
@@ -535,15 +677,21 @@ impl UiSystem {
             )
         });
 
-        if dragging && shift {
+        let moved = dragging && delta != Vec2::ZERO;
+        if moved && shift {
             let speed = self.orbit.distance * ORBIT_PAN_SPEED;
             self.orbit.pan(-delta.x * speed, delta.y * speed);
-        } else if dragging {
+        } else if moved {
             self.orbit
                 .rotate(-delta.x * ORBIT_ROTATE_SPEED, delta.y * ORBIT_ROTATE_SPEED);
         }
         if scroll != 0.0 {
             self.orbit.zoom((-scroll * ORBIT_ZOOM_SPEED).exp());
+        }
+
+        // Flying the rig is the input that takes the camera back off the path.
+        if moved || scroll != 0.0 {
+            self.rig_owns_camera = true;
         }
     }
 
@@ -635,6 +783,9 @@ impl UiSystem {
                                     self.playback.playing = false;
                                     self.last_logged_frame = usize::MAX;
                                     self.loaded_replay = Some(r);
+                                    // Make POV the default camera mode after loading a replay.
+                                    // Maybe Orbit is better? Idk.
+                                    self.camera_mode = CameraMode::Pov;
                                 }
                                 Err(e) => log::error!("failed to load replay: {e}"),
                             }
@@ -681,7 +832,6 @@ impl UiSystem {
                         return;
                     };
                     let mut kf = pre_edit.clone();
-                    let live_orbit = self.orbit_for_new_keyframe();
 
                     ui.vertical(|ui| {
                         ui.heading("Keyframe details");
@@ -768,42 +918,46 @@ impl UiSystem {
                                 ui.label("Pitch");
                                 ui.drag_angle(&mut orbit.pitch);
                             });
+                            ui.horizontal(|ui| {
+                                ui.label("Aim height");
+                                ui.add(
+                                    DragValue::new(&mut orbit.aim_height)
+                                        .speed(0.5)
+                                        .range(0.0..=f32::MAX),
+                                );
+                            })
+                            .response
+                            .on_hover_text(
+                                "This key's pivot height above the skater. A run of keys \
+                                 interpolates it, so a shot can rise.",
+                            );
                             // Re-clamp whatever the drag fields let through.
                             orbit.rotate(0.0, 0.0);
                         }
-
-                        // Captures what drives the camera now: orbiting makes
-                        // this an orbit key, anything else a plain one.
-                        if ui.button("Overwrite with current camera").clicked() {
-                            if let Some(pose) = game::camera() {
-                                kf.pose = pose;
-                                kf.orbit = live_orbit;
-                            }
-                        }
-
-                        ui.separator();
                     });
 
                     if pre_edit != kf {
-                        let was_on_keyframe = (self.playback.time - pre_edit.time).abs() < 1e-3;
-
                         if let Some(frame) = self.timeline.path.get_mut(i) {
                             *frame = kf.clone();
                         }
                         if pre_edit.time != kf.time {
                             self.timeline.sort();
-                        }
-                        self.load_selected_orbit();
-
-                        // Live preview: snap playhead and push new pose immediately.
-                        if self.playback.mode_active && was_on_keyframe {
+                            // The playhead is what marks this key as selected,
+                            // so retiming the key takes the playhead with it.
                             self.playback.time = kf.time;
                             self.playback.last_update = Some(Instant::now());
+                        }
+                        if pre_edit.orbit != kf.orbit {
+                            self.load_selected_orbit();
+                        }
+
+                        if self.playback.mode_active {
                             game::set_camera(&kf.resolve(None));
                         }
                     }
                 } else {
-                    ui.label("No keyframe selected.");
+                    ui.label("Playhead is not on a keyframe.");
+                    ui.weak("Click a marker, or step with ⏪ ⏩, to edit one.");
                 }
 
                 // The pivot and the mouse bindings belong to the orbit rig
@@ -815,15 +969,16 @@ impl UiSystem {
                     ui.horizontal(|ui| {
                         ui.label("Aim height");
                         ui.add(
-                            DragValue::new(&mut self.aim_height)
+                            DragValue::new(&mut self.orbit.aim_height)
                                 .speed(0.5)
                                 .range(0.0..=f32::MAX),
                         );
                     })
                     .response
                     .on_hover_text(
-                        "How far above the skater's feet the pivot sits. The recorded \
-                         position is the root bone, which is between them.",
+                        "The live rig's pivot height above the skater - the recorded position \
+                         is the root bone, between the feet. A new key takes this; an \
+                         existing key keeps its own, editable above.",
                     );
                     if ui
                         .button("🎯 Re-centre on camera")
@@ -837,15 +992,47 @@ impl UiSystem {
                     }
                     ui.weak("drag orbit · shift+drag pan · wheel zoom");
                 }
+
+                let mut apply = false;
+                let mut reset = false;
+                if self.apply_would_change_selected() {
+                    ui.separator();
+                    ui.colored_label(STALE_KEY_COLOR, "● Camera has moved off this keyframe");
+                    apply = ui
+                        .add_sized(
+                            [ui.available_width(), 26.0],
+                            egui::Button::new("⬇ Apply camera to keyframe"),
+                        )
+                        .on_hover_text(concat!(
+                            "Overwrite this keyframe with the live camera: position, ",
+                            "rotation, fov, and the orbit the mouse is flying.",
+                        ))
+                        .clicked();
+                    reset = ui
+                        .add_sized(
+                            [ui.available_width(), 22.0],
+                            egui::Button::new("↩ Reset camera to keyframe"),
+                        )
+                        .on_hover_text(concat!(
+                            "Put the camera back on this keyframe, dropping framing ",
+                            "that has not been applied.",
+                        ))
+                        .clicked();
+                }
+
+                if apply {
+                    self.apply_camera_to_selected();
+                }
+                if reset {
+                    self.reset_camera_to_selected();
+                }
             });
     }
 
     pub fn update_timeline(&mut self, ctx: &eguiContext) {
-        let prev_selected = self.timeline.selected_index;
+        // Nothing in here selects anything: the strip moves the playhead and
+        // `update` derives the selection from it.
         self.draw_timeline(ctx);
-        if self.timeline.selected_index != prev_selected {
-            self.load_selected_orbit();
-        }
     }
 
     fn draw_timeline(&mut self, ctx: &eguiContext) {
@@ -853,25 +1040,44 @@ impl UiSystem {
             // Two bars: what you are editing, then how you are looking at it.
             ui.horizontal(|ui| {
                 ui.label("Keyframe");
-                if ui.button("➕ Add").clicked() {
-                    if let Some(pose) = game::camera() {
-                        let orbit = self.orbit_for_new_keyframe();
-                        self.timeline.add_keyframe(Keyframe {
-                            time: self.playback.time,
-                            pose,
-                            tension: 0.25,
-                            orbit,
-                        });
-                    }
-                }
 
-                ui.add_enabled_ui(self.timeline.selected_index.is_some(), |ui| {
+                // POV flies the camera the replay was shot with and ignores the
+                // authored path.
+                let authoring = self.camera_mode != CameraMode::Pov;
+                const POV_HINT: &str = "POV plays the replay's own camera — keyframes are ignored";
+
+                ui.add_enabled_ui(authoring, |ui| {
+                    if ui
+                        .button("➕ Add")
+                        .on_disabled_hover_text(POV_HINT)
+                        .clicked()
+                    {
+                        if let Some(pose) = game::camera() {
+                            let orbit = self.orbit_for_new_keyframe();
+                            let time = self.timeline.free_time_at(self.playback.time);
+                            self.timeline.add_keyframe(Keyframe {
+                                time,
+                                pose,
+                                tension: 0.25,
+                                orbit,
+                            });
+                            self.playback.time = time;
+                            self.playback.last_update = Some(Instant::now());
+                        }
+                    }
+                });
+
+                ui.add_enabled_ui(authoring && self.timeline.selected_index.is_some(), |ui| {
                     if ui.button("📋 Duplicate").clicked() {
                         if let Some(i) = self.timeline.selected_index {
                             if let Some(kf) = self.timeline.path.get(i).cloned() {
                                 let mut dup = kf;
-                                dup.time += 1.0;
+                                dup.time = self.timeline.free_time_at(dup.time + KEYFRAME_SPACING);
+                                let time = dup.time;
                                 self.timeline.add_keyframe(dup);
+                                // Follow the copy, so it is the selected key.
+                                self.playback.time = time;
+                                self.playback.last_update = Some(Instant::now());
                             }
                         }
                     }
@@ -893,16 +1099,15 @@ impl UiSystem {
                     self.playback.playing = false;
                 }
 
-                let can_go_prev = self.timeline.selected_index.is_some_and(|i| i > 0);
+                let prev_key = self.timeline.time_before(self.playback.time);
                 if ui
-                    .add_enabled(can_go_prev, egui::Button::new("⏪ Previous"))
+                    .add_enabled(prev_key.is_some(), egui::Button::new("⏪ Previous"))
                     .clicked()
                 {
-                    if let Some(i) = self.timeline.selected_index {
-                        if let Some(time) = self.timeline.select(i - 1) {
-                            self.playback.time = time;
-                            self.playback.last_update = Some(Instant::now());
-                        }
+                    if let Some(time) = prev_key {
+                        self.playback.time = time;
+                        self.playback.last_update = Some(Instant::now());
+                        self.timeline.scroll_to(time);
                     }
                 }
 
@@ -915,19 +1120,15 @@ impl UiSystem {
                     self.playback.toggle(self.playback_end_time());
                 }
 
-                let can_go_next = self
-                    .timeline
-                    .selected_index
-                    .is_some_and(|i| i < self.timeline.path.len() - 1);
+                let next_key = self.timeline.time_after(self.playback.time);
                 if ui
-                    .add_enabled(can_go_next, egui::Button::new("⏩ Next"))
+                    .add_enabled(next_key.is_some(), egui::Button::new("⏩ Next"))
                     .clicked()
                 {
-                    if let Some(i) = self.timeline.selected_index {
-                        if let Some(time) = self.timeline.select(i + 1) {
-                            self.playback.time = time;
-                            self.playback.last_update = Some(Instant::now());
-                        }
+                    if let Some(time) = next_key {
+                        self.playback.time = time;
+                        self.playback.last_update = Some(Instant::now());
+                        self.timeline.scroll_to(time);
                     }
                 }
 
@@ -943,11 +1144,25 @@ impl UiSystem {
 
             ui.horizontal(|ui| {
                 let prev_mode = self.camera_mode;
+                let pov_offered = game::is_replay_available();
+                let pov_ready = self.loaded_replay.is_some();
                 egui::ComboBox::from_id_salt("CameraMode")
                     .selected_text(self.camera_mode.label())
                     .width(80.0)
                     .show_ui(ui, |ui| {
                         for mode in CameraMode::ALL {
+                            if mode == CameraMode::Pov {
+                                if !pov_offered {
+                                    continue;
+                                }
+                                if !pov_ready {
+                                    ui.add_enabled_ui(false, |ui| {
+                                        ui.selectable_label(false, mode.label())
+                                            .on_disabled_hover_text("Load a replay first");
+                                    });
+                                    continue;
+                                }
+                            }
                             ui.selectable_value(&mut self.camera_mode, mode, mode.label());
                         }
                     });
@@ -1064,6 +1279,7 @@ impl UiSystem {
                 }
             }
 
+            let stale = self.apply_would_change_selected();
             let mut needs_sort = false;
             for i in 0..self.timeline.path.len() {
                 let kf_time = {
@@ -1079,7 +1295,13 @@ impl UiSystem {
                 let kf_top = timeline_top + 24.0;
                 let kf_bottom = timeline_rect.bottom() - 3.0;
                 let color = if self.timeline.selected_index == Some(i) {
-                    Color32::YELLOW
+                    // Only the selected key can be stale: it is the only one
+                    // being compared against the live camera.
+                    if stale {
+                        STALE_KEY_COLOR
+                    } else {
+                        Color32::YELLOW
+                    }
                 } else if self.timeline.path.frames()[i].orbit.is_some() {
                     Color32::from_rgb(255, 160, 60)
                 } else {
@@ -1090,22 +1312,23 @@ impl UiSystem {
                 let response = ui.allocate_rect(line_rect, Sense::click_and_drag());
                 painter.rect_filled(line_rect, 4.0, color);
 
+                // Going to a key is selecting it, so a click is a seek.
                 if response.clicked() {
-                    self.timeline.selected_index = Some(i);
-                    if self.playback.mode_active {
-                        self.playback.time = kf_time;
-                        self.playback.last_update = Some(Instant::now());
-                    }
+                    self.playback.time = kf_time;
+                    self.playback.last_update = Some(Instant::now());
                 }
                 if response.drag_started() {
                     self.timeline.dragging_index = Some(i);
-                    self.timeline.selected_index = Some(i);
                 }
                 if response.dragged() && self.timeline.dragging_index == Some(i) {
                     if let Some(kf) = self.timeline.path.get_mut(i) {
                         kf.time += response.drag_delta().x / pixels_per_second;
                         kf.time = kf.time.clamp(0.0, self.timeline.total_duration);
+                        // Carry the playhead along, or dragging a key would
+                        // slide it out from under the selection.
+                        self.playback.time = kf.time;
                     }
+                    self.playback.last_update = Some(Instant::now());
                 }
                 if response.drag_stopped() {
                     needs_sort = true;
@@ -1178,46 +1401,60 @@ pub fn ui_render_loop(ctx: &eguiContext, _i: &mut i32) {
         ui.toggle_showing();
     }
 
-    if ui.playback.playing || ui.recording.active {
-        ctx.request_repaint();
-    }
+    ctx.request_repaint();
 
-    // F2 starts/stops recording regardless of freecam — gameplay happens outside freecam.
-    if ctx.input(|i| i.key_pressed(egui::Key::F2)) {
-        if ui.recording.active {
-            ui.recording.stop();
-        } else if !ui.recording.name.is_empty() {
-            match ui.recording.start() {
-                Ok(()) => log::debug!("started recording via F2: {}", ui.recording.name),
-                Err(e) => log::error!("failed creating replay: {}", e),
-            }
+    // We have to restore games FOV.
+    if !game::in_freecam() {
+        if let Some(fov) = ui.entry_fov.take() {
+            log::debug!("[camera] left freecam, restoring fov {:.1}", fov);
+            game::set_fov(fov);
         }
     }
 
-    if ui.recording.active {
-        ctx.debug_painter().text(
-            Pos2::new(0., 40.),
-            Align2::LEFT_TOP,
-            format!("Recording: {}", ui.recording.name),
-            FontId::default(),
-            Color32::LIGHT_RED,
-        );
-        ctx.debug_painter().text(
-            Pos2::new(0., 60.),
-            Align2::LEFT_TOP,
-            "Press F2 to stop recording.",
-            FontId::default(),
-            Color32::WHITE,
-        );
+    // A backend with stubbed capture gets no recording UI at all: not the F2
+    // shortcut, not the overlay, not the Replay window.
+    let replay_available = game::is_replay_available();
+
+    if replay_available {
+        if ctx.input(|i| i.key_pressed(egui::Key::F2)) {
+            if ui.recording.active {
+                ui.recording.stop();
+            } else if !ui.recording.name.is_empty() {
+                match ui.recording.start() {
+                    Ok(()) => log::debug!("started recording via F2: {}", ui.recording.name),
+                    Err(e) => log::error!("failed creating replay: {}", e),
+                }
+            }
+        }
+
+        if ui.recording.active {
+            ctx.debug_painter().text(
+                Pos2::new(0., 40.),
+                Align2::LEFT_TOP,
+                format!("Recording: {}", ui.recording.name),
+                FontId::default(),
+                Color32::LIGHT_RED,
+            );
+            ctx.debug_painter().text(
+                Pos2::new(0., 60.),
+                Align2::LEFT_TOP,
+                "Press F2 to stop recording.",
+                FontId::default(),
+                Color32::WHITE,
+            );
+        }
     }
 
+    let has_camera = game::camera().is_some();
     if !ui.is_showing() {
+        ui.was_showing = false;
         return;
     }
+    let just_opened = !std::mem::replace(&mut ui.was_showing, true);
 
     // No camera yet means freecam has never been entered, so there is nothing
     // to author against.
-    if game::camera().is_some() {
+    if has_camera {
         ctx.debug_painter().text(
             Pos2::new(0., 0.),
             Align2::LEFT_TOP,
@@ -1226,8 +1463,137 @@ pub fn ui_render_loop(ctx: &eguiContext, _i: &mut i32) {
             Color32::LIGHT_YELLOW,
         );
         ui.update_timeline(ctx);
-        ui.update_replay_detail(ctx);
+        if replay_available {
+            ui.update_replay_detail(ctx);
+        }
         ui.update_keyframe_detail(ctx);
         ui.update_orbit_input(ctx);
+    }
+
+    // We don't want to autofocus any text inputs.
+    if just_opened {
+        ctx.memory_mut(|m| m.stop_text_input());
+    }
+
+    draw_cursor(ctx);
+}
+
+/// Use egui cursor.
+fn draw_cursor(ctx: &eguiContext) {
+    let Some(tip) = ctx.pointer_latest_pos() else {
+        return;
+    };
+    if ctx.output(|o| o.cursor_icon) == CursorIcon::None {
+        return;
+    }
+
+    const OUTLINE: [[f32; 2]; 7] = [
+        [0.0, 0.0],
+        [0.0, 17.0],
+        [4.2, 13.2],
+        [6.8, 18.8],
+        [9.6, 17.5],
+        [7.0, 12.0],
+        [12.0, 12.0],
+    ];
+    let p = |i: usize| tip + Vec2::new(OUTLINE[i][0], OUTLINE[i][1]);
+
+    let painter = ctx.layer_painter(LayerId::new(Order::Debug, Id::new("falke_cursor")));
+
+    for piece in [
+        vec![p(0), p(1), p(2)],
+        vec![p(0), p(2), p(5)],
+        vec![p(0), p(5), p(6)],
+        vec![p(2), p(3), p(4), p(5)],
+    ] {
+        painter.add(Shape::convex_polygon(piece, Color32::WHITE, Stroke::NONE));
+    }
+    painter.add(Shape::closed_line(
+        (0..OUTLINE.len()).map(p).collect(),
+        Stroke::new(1.0f32, Color32::BLACK),
+    ));
+}
+
+// Tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::Quat;
+
+    fn kf(time: f32) -> Keyframe {
+        Keyframe {
+            time,
+            pose: CameraPose {
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+                fov: 90.0,
+            },
+            tension: 0.25,
+            orbit: None,
+        }
+    }
+
+    /// Adding twice without moving the playhead - the normal way to frame two
+    /// orbit angles in a row - must not stack both keys on one time, or the
+    /// path has no span to interpolate across.
+    #[test]
+    fn adding_twice_at_one_playhead_time_leaves_a_span() {
+        let mut timeline = Timeline::default();
+
+        let first = timeline.free_time_at(0.0);
+        timeline.add_keyframe(kf(first));
+        let second = timeline.free_time_at(0.0);
+        timeline.add_keyframe(kf(second));
+
+        assert_eq!(first, 0.0);
+        assert_eq!(second, KEYFRAME_SPACING);
+        assert!(timeline.path.sample(KEYFRAME_SPACING / 2.0, None).is_some());
+    }
+
+    /// Selection is a question about the playhead, not a stored index, so a
+    /// time between keys has nothing selected and the transport is measured
+    /// from the playhead too.
+    #[test]
+    fn selection_is_whichever_key_the_playhead_is_on() {
+        let mut timeline = Timeline::default();
+        timeline.add_keyframe(kf(0.0));
+        timeline.add_keyframe(kf(2.0));
+
+        assert_eq!(timeline.key_at(0.0), Some(0));
+        assert_eq!(timeline.key_at(2.0), Some(1));
+        assert_eq!(timeline.key_at(1.0), None);
+
+        assert_eq!(timeline.time_after(0.0), Some(2.0));
+        assert_eq!(timeline.time_after(1.0), Some(2.0));
+        assert_eq!(timeline.time_after(2.0), None);
+        assert_eq!(timeline.time_before(2.0), Some(0.0));
+        assert_eq!(timeline.time_before(1.0), Some(0.0));
+        assert_eq!(timeline.time_before(0.0), None);
+    }
+
+    /// A key added before the existing ones is still the one the playhead ends
+    /// up on - the old code selected `len - 1`, which `push`'s sort had made
+    /// somebody else.
+    #[test]
+    fn adding_out_of_order_selects_the_new_key() {
+        let mut timeline = Timeline::default();
+        timeline.add_keyframe(kf(5.0));
+        timeline.add_keyframe(kf(1.0));
+
+        assert_eq!(timeline.key_at(1.0), Some(0));
+        assert_eq!(timeline.path.len(), 2);
+    }
+
+    #[test]
+    fn free_time_at_steps_past_every_taken_slot() {
+        let mut timeline = Timeline::default();
+        for t in [0.0, KEYFRAME_SPACING, 2.0 * KEYFRAME_SPACING] {
+            timeline.add_keyframe(kf(t));
+        }
+
+        assert_eq!(timeline.free_time_at(0.0), 3.0 * KEYFRAME_SPACING);
+        // An untaken time is left alone.
+        assert_eq!(timeline.free_time_at(10.0), 10.0);
     }
 }

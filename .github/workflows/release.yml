@@ -1,0 +1,80 @@
+name: release
+
+on:
+  push:
+    tags: ['*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to package (no release is published)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ github.event.inputs.version || github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nightly, because retour's thiscall-abi feature gates on a nightly
+      # feature attribute. The DLL is 32-bit, matching the games.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: i686-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build and package
+        shell: pwsh
+        run: ./release.ps1
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path build/* -DestinationPath "falke-$env:VERSION.zip"
+
+      - name: Extract release notes
+        shell: pwsh
+        run: |
+          $lines = Get-Content CHANGELOG.md
+          $isRule = { param($i) $i -lt $lines.Count -and $lines[$i] -match '^=+$' }
+
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i].Trim() -eq $env:VERSION -and (& $isRule ($i + 1))) {
+                  $start = $i + 2
+                  break
+              }
+          }
+
+          if ($start -lt 0) {
+              Write-Host "::warning::No CHANGELOG.md section for $env:VERSION"
+              "See CHANGELOG.md." | Set-Content notes.md -Encoding utf8
+              exit 0
+          }
+
+          $body = @()
+          for ($i = $start; $i -lt $lines.Count; $i++) {
+              # A version header is a line with a === rule under it.
+              if ($lines[$i].Trim() -ne '' -and (& $isRule ($i + 1))) { break }
+              $body += $lines[$i]
+          }
+          ($body -join "`n").Trim() | Set-Content notes.md -Encoding utf8
+          Get-Content notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: falke-${{ env.VERSION }}
+          path: falke-${{ env.VERSION }}.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: falke ${{ env.VERSION }}
+          body_path: notes.md
+          files: falke-${{ env.VERSION }}.zip
