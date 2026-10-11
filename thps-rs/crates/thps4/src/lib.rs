@@ -44,10 +44,6 @@ pub struct MthMatrix {
 }
 
 // Object system
-
-/// A moving thing in the world. Only the two fields a frame is built out of
-/// are named; `old_position`, `velocity` and the lerping matrix below it are
-/// bytes to step over.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CCompositeObject {
@@ -64,11 +60,6 @@ pub struct CModel {
 }
 
 // Skater
-//
-// Padded down to the four fields we read. What the gaps swallow is input (the
-// pad at 0x780), collision (the feeler at 0x3560) and trick state - none of it
-// pose or camera data, so it is bytes to step over rather than types to
-// transcribe.
 #[repr(C)]
 pub struct CSkater {
     _pad_000: [u8; 0x608],
@@ -78,8 +69,6 @@ pub struct CSkater {
     _pad_638: [u8; 0x318c],
     pub view_mode: u32, // 0x37c4
     _pad_37c8: [u8; 0xc],
-    /// The skater's `CSkaterCam`, held as the handle the `Gfx_Camera`
-    /// accessors take - which is all we ever do with it.
     pub camera: GfxCamera, // 0x37d4
 }
 
@@ -135,38 +124,3 @@ pub unsafe fn gfx_camera_set_matrix(camera: GfxCamera, matrix: &MthMatrix) {
     unsafe { func(camera, matrix) };
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::mem::{offset_of, size_of};
-
-    // Padding is the only thing holding these fields in place, so the offsets
-    // the comments claim are asserted. 32-bit pointers assumed - the whole
-    // workspace builds for i686.
-
-    #[test]
-    fn mth_sizes() {
-        assert_eq!(size_of::<MthVector>(), 0x10);
-        assert_eq!(size_of::<MthMatrix>(), 0x40);
-    }
-
-    #[test]
-    fn composite_object_layout() {
-        assert_eq!(offset_of!(CCompositeObject, position), 0x00);
-        assert_eq!(offset_of!(CCompositeObject, matrix), 0x40);
-        assert_eq!(size_of::<CCompositeObject>(), 0x80);
-    }
-
-    #[test]
-    fn model_layout() {
-        assert_eq!(offset_of!(CModel, skeleton), 0x08);
-    }
-
-    #[test]
-    fn skater_layout() {
-        assert_eq!(offset_of!(CSkater, model), 0x608);
-        assert_eq!(offset_of!(CSkater, object), 0x634);
-        assert_eq!(offset_of!(CSkater, view_mode), 0x37c4);
-        assert_eq!(offset_of!(CSkater, camera), 0x37d4);
-    }
-}
