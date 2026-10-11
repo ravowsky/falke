@@ -7,11 +7,14 @@ use anyhow::{Context, Result};
 
 use crate::{
     camera::CameraPose,
-    math::{lerp_arr, Quat, Vec3},
+    math::{Quat, Vec3, lerp_arr},
 };
 
-const FLK_REPLAY_VERSION: u8 = 2;
+const FLK_REPLAY_VERSION: u8 = 3;
 const REPLAY_FOLDER: &str = "Replays";
+
+/// Room for the largest skeleton any supported game has (currently THPS4 with 55).
+pub const MAX_BONES: usize = 55;
 
 pub struct Replay {
     file_path: PathBuf,
@@ -24,8 +27,17 @@ pub struct Replay {
 pub struct SkaterState {
     pub world_pos: [f32; 3],
     pub world_matrix: [f32; 16],
-    pub bone_quats: [[f32; 4]; 50],
-    pub bone_trans: [[f32; 4]; 50],
+    /// How many leading entries of the bone arrays this skater's skeleton has.
+    pub bone_count: u8,
+    pub bone_quats: [[f32; 4]; MAX_BONES],
+    pub bone_trans: [[f32; 4]; MAX_BONES],
+}
+
+impl SkaterState {
+    /// `bone_count` as a usable length, clamped to what the arrays can hold.
+    pub fn bones(&self) -> usize {
+        (self.bone_count as usize).min(MAX_BONES)
+    }
 }
 
 /// One frame of a replay.
@@ -70,12 +82,16 @@ impl Replay {
 
         writer.write_all(&[state.skaters.len() as u8])?;
         for skater in &state.skaters {
+            // Only the bones this skeleton has: the arrays are sized for the
+            // largest game, not for the one being recorded.
+            let bones = skater.bones();
+            writer.write_all(&[bones as u8])?;
             write_f32s(writer, &skater.world_pos)?;
             write_f32s(writer, &skater.world_matrix)?;
-            for quat in &skater.bone_quats {
+            for quat in &skater.bone_quats[..bones] {
                 write_f32s(writer, quat)?;
             }
-            for trans in &skater.bone_trans {
+            for trans in &skater.bone_trans[..bones] {
                 write_f32s(writer, trans)?;
             }
         }
@@ -150,21 +166,31 @@ impl LoadedReplay {
 
             let mut skaters = Vec::with_capacity(skater_count);
             for _ in 0..skater_count {
+                let mut bone_count = [0u8; 1];
+                file.read_exact(&mut bone_count)?;
+                let bone_count = bone_count[0];
+                if bone_count as usize > MAX_BONES {
+                    anyhow::bail!(
+                        "replay wants {bone_count} bones per skater, more than the {MAX_BONES} a frame holds"
+                    );
+                }
+
                 let world_pos = read_f32s::<3>(&mut file)?;
                 let world_matrix = read_f32s::<16>(&mut file)?;
 
-                let mut bone_quats = [[0f32; 4]; 50];
-                for quat in bone_quats.iter_mut() {
+                let mut bone_quats = [[0f32; 4]; MAX_BONES];
+                for quat in bone_quats[..bone_count as usize].iter_mut() {
                     *quat = read_f32s::<4>(&mut file)?;
                 }
-                let mut bone_trans = [[0f32; 4]; 50];
-                for trans in bone_trans.iter_mut() {
+                let mut bone_trans = [[0f32; 4]; MAX_BONES];
+                for trans in bone_trans[..bone_count as usize].iter_mut() {
                     *trans = read_f32s::<4>(&mut file)?;
                 }
 
                 skaters.push(SkaterState {
                     world_pos,
                     world_matrix,
+                    bone_count,
                     bone_quats,
                     bone_trans,
                 });
@@ -222,17 +248,17 @@ impl LoadedReplay {
             .iter()
             .zip(b.skaters.iter())
             .map(|(sa, sb)| {
-                let mut bone_quats = [[0f32; 4]; 50];
-                for i in 0..50 {
+                let bones = sa.bones().min(sb.bones());
+                let mut bone_quats = [[0f32; 4]; MAX_BONES];
+                let mut bone_trans = [[0f32; 4]; MAX_BONES];
+                for i in 0..bones {
                     bone_quats[i] = slerp_quat(sa.bone_quats[i], sb.bone_quats[i], frac);
-                }
-                let mut bone_trans = [[0f32; 4]; 50];
-                for i in 0..50 {
                     bone_trans[i] = lerp_arr(sa.bone_trans[i], sb.bone_trans[i], frac);
                 }
                 SkaterState {
                     world_pos: lerp_arr(sa.world_pos, sb.world_pos, frac),
                     world_matrix: lerp_arr(sa.world_matrix, sb.world_matrix, frac),
+                    bone_count: bones as u8,
                     bone_quats,
                     bone_trans,
                 }

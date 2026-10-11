@@ -2,6 +2,7 @@
 
 use std::{
     mem::transmute,
+    ptr,
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -22,18 +23,21 @@ use thps_rs::thug2::{
 };
 
 use thps_rs::crc;
-use windows::Win32::UI::WindowsAndMessaging::ShowCursor;
 
 use crate::{
     camera::CameraPose,
     game::Game,
     math::Vec3,
-    replay::{ReplayState, SkaterState},
+    replay::{MAX_BONES, ReplayState, SkaterState},
 };
+
+/// Bones in a THUG2 skater skeleton. `Skeleton::Update` hands over the arrays
+/// without a length, so this is the only thing that bounds them.
+const BONE_COUNT: usize = 50;
 
 static_detour! {
     pub static ViewerTranslateLocalHook: unsafe extern fn(*mut CCompositeObject, *mut usize) -> ();
-    static SkeletonUpdateHook: unsafe extern "thiscall" fn(*const usize, *mut [[f32;4];50], *mut [[f32;4];50]);
+    static SkeletonUpdateHook: unsafe extern "thiscall" fn(*const usize, *mut [f32; 4], *mut [f32; 4]);
     static GetActiveCameraHook: unsafe extern fn(i32) -> usize;
 }
 
@@ -41,8 +45,8 @@ static_detour! {
 unsafe impl Send for SkeletonState {}
 unsafe impl Sync for SkeletonState {}
 struct SkeletonState {
-    quaternions: Option<*mut [[f32; 4]; 50]>,
-    translations: Option<*mut [[f32; 4]; 50]>,
+    quaternions: Option<*mut [f32; 4]>,
+    translations: Option<*mut [f32; 4]>,
 }
 static SKELETON_STATE: Mutex<SkeletonState> = Mutex::new(SkeletonState {
     quaternions: None,
@@ -99,6 +103,10 @@ impl Game for Thug2 {
         thps_rs::thug2::in_freecam()
     }
 
+    fn is_replay_available(&self) -> bool {
+        true
+    }
+
     /// The freecam viewer, what the user flies.
     fn camera(&self) -> Option<CameraPose> {
         match CAMERA_OBJ.load(Ordering::Relaxed) {
@@ -112,6 +120,14 @@ impl Game for Thug2 {
         if obj != 0 {
             write_camera(obj, pose);
         }
+    }
+
+    fn fov(&self) -> f32 {
+        read_screen_angle()
+    }
+
+    fn set_fov(&self, fov: f32) {
+        write_screen_angle(fov);
     }
 
     unsafe fn apply_frame(&self, frame: &ReplayState) {
@@ -155,10 +171,16 @@ impl Game for Thug2 {
 
                 // Write replay bone poses, call SkeletonUpdate to recompute bone
                 // matrices from them, render with no_anim=true, then restore.
-                let saved_q = *qp;
-                let saved_t = *tp;
-                *qp = skater.bone_quats;
-                *tp = skater.bone_trans;
+                let mut saved_q = [[0f32; 4]; BONE_COUNT];
+                let mut saved_t = [[0f32; 4]; BONE_COUNT];
+                ptr::copy_nonoverlapping(qp, saved_q.as_mut_ptr(), BONE_COUNT);
+                ptr::copy_nonoverlapping(tp, saved_t.as_mut_ptr(), BONE_COUNT);
+
+                // A frame recorded in another game may carry more bones than
+                // this skeleton has; anything past ours is not ours to write.
+                let bones = skater.bones().min(BONE_COUNT);
+                ptr::copy_nonoverlapping(skater.bone_quats.as_ptr(), qp, bones);
+                ptr::copy_nonoverlapping(skater.bone_trans.as_ptr(), tp, bones);
                 SkeletonUpdateHook.call(skeleton_ptr as *const usize, qp, tp);
                 if let Some(render) = MODEL_RENDER_FN.get() {
                     render(
@@ -168,8 +190,8 @@ impl Game for Thug2 {
                         skeleton_ptr,
                     );
                 }
-                *qp = saved_q;
-                *tp = saved_t;
+                ptr::copy_nonoverlapping(saved_q.as_ptr(), qp, BONE_COUNT);
+                ptr::copy_nonoverlapping(saved_t.as_ptr(), tp, BONE_COUNT);
             }
         }
     }
@@ -298,7 +320,6 @@ fn hk_viewer_translate_local(obj: *mut CCompositeObject, vec: *mut usize) {
     // known, and where the UI first has something to fly.
     if CAMERA_OBJ.swap(obj as usize, Ordering::Relaxed) == 0 {
         log::debug!("[addr] Camera: 0x{:x}", obj as usize);
-        unsafe { ShowCursor(true) };
     }
     unsafe { ViewerTranslateLocalHook.call(obj, vec) }
 }
@@ -311,7 +332,7 @@ fn hk_get_active_camera(index: i32) -> usize {
     camera
 }
 
-fn hk_skeleton_update(this: *const usize, pquat: *mut [[f32; 4]; 50], ptrans: *mut [[f32; 4]; 50]) {
+fn hk_skeleton_update(this: *const usize, pquat: *mut [f32; 4], ptrans: *mut [f32; 4]) {
     unsafe { SkeletonUpdateHook.call(this, pquat, ptrans) };
     if let Ok(mut state) = SKELETON_STATE.lock() {
         state.quaternions = Some(pquat);
@@ -392,29 +413,32 @@ unsafe fn capture_skater_state(object: *mut CObject) -> Option<SkaterState> {
 
     let world_matrix = unsafe { (*(object as *mut CCompositeObject)).matrix };
 
-    let (quaternions, translations) = {
+    let (quat_ptr, trans_ptr) = {
         let state = SKELETON_STATE.lock().ok().or_else(|| {
             log::warn!("[capture] failed to lock SKELETON_STATE");
             None
         })?;
-        let quats = unsafe {
-            *(state.quaternions.or_else(|| {
-                log::warn!(
-                    "[capture] quaternions pointer is None — SkeletonUpdateHook has not fired yet"
-                );
-                None
-            })?)
-        };
-        let trans = unsafe {
-            *(state.translations.or_else(|| {
-                log::warn!(
-                    "[capture] translations pointer is None — SkeletonUpdateHook has not fired yet"
-                );
-                None
-            })?)
-        };
+        let quats = state.quaternions.or_else(|| {
+            log::warn!(
+                "[capture] quaternions pointer is None — SkeletonUpdateHook has not fired yet"
+            );
+            None
+        })?;
+        let trans = state.translations.or_else(|| {
+            log::warn!(
+                "[capture] translations pointer is None — SkeletonUpdateHook has not fired yet"
+            );
+            None
+        })?;
         (quats, trans)
     };
+
+    let mut quaternions = [[0f32; 4]; MAX_BONES];
+    let mut translations = [[0f32; 4]; MAX_BONES];
+    unsafe {
+        ptr::copy_nonoverlapping(quat_ptr, quaternions.as_mut_ptr(), BONE_COUNT);
+        ptr::copy_nonoverlapping(trans_ptr, translations.as_mut_ptr(), BONE_COUNT);
+    }
 
     let mut world_pos = [0.0f32; 4];
     unsafe {
@@ -434,6 +458,7 @@ unsafe fn capture_skater_state(object: *mut CObject) -> Option<SkaterState> {
     Some(SkaterState {
         world_pos: [world_pos[0], world_pos[1], world_pos[2]],
         world_matrix,
+        bone_count: BONE_COUNT as u8,
         bone_quats: quaternions,
         bone_trans: translations,
     })
