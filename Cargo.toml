@@ -3,7 +3,7 @@ members = [".", "thps-rs", "thps-rs/crates/thug2", "thps-rs/crates/thps4", "thps
 
 [package]
 name = "falke"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2024"
 
 [lib]
