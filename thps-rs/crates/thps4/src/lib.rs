@@ -45,56 +45,15 @@ pub struct MthMatrix {
 
 // Object system
 
+/// A moving thing in the world. Only the two fields a frame is built out of
+/// are named; `old_position`, `velocity` and the lerping matrix below it are
+/// bytes to step over.
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct CCompositeObject {
-    pub position: MthVector,     // 0x00
-    pub old_position: MthVector, // 0x10
-    _pad_020: [u8; 0x10],
-    pub velocity: MthVector,       // 0x30
-    pub matrix: MthMatrix,         // 0x40
-    pub lerping_matrix: MthMatrix, // 0x80
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CFeeler {
-    _pad_000: [u8; 0x8c],
-    pub normal: MthVector, // 0x8c
-}
-
-// Pad input
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct CSkaterButton {
-    pub pressed: u32,       // 0x00
-    pub pressed_time: u32,  // 0x04
-    pub released_time: u32, // 0x08
-    pub pressure: u32,      // 0x0c
-    pub triggered: u32,     // 0x10
-    pub released: u32,      // 0x14
-    pub checksum: u32,      // 0x18
-    pub debounce: f32,      // 0x1c
-    pub unk: u32,           // 0x20
-}
-
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct CSkaterPad {
-    pub up: CSkaterButton,       // 0x000
-    pub down: CSkaterButton,     // 0x024
-    pub left: CSkaterButton,     // 0x048
-    pub right: CSkaterButton,    // 0x06c
-    pub l1: CSkaterButton,       // 0x090
-    pub l2: CSkaterButton,       // 0x0b4
-    pub r1: CSkaterButton,       // 0x0d8
-    pub r2: CSkaterButton,       // 0x0fc
-    pub circle: CSkaterButton,   // 0x120
-    pub square: CSkaterButton,   // 0x144
-    pub triangle: CSkaterButton, // 0x168
-    pub x: CSkaterButton,        // 0x18c
-    pub start: CSkaterButton,    // 0x1b0
-    pub select: CSkaterButton,   // 0x1d4
+    pub position: MthVector, // 0x00
+    _pad_010: [u8; 0x30],
+    pub matrix: MthMatrix, // 0x40
 }
 
 /// The renderable model.
@@ -105,32 +64,23 @@ pub struct CModel {
 }
 
 // Skater
+//
+// Padded down to the four fields we read. What the gaps swallow is input (the
+// pad at 0x780), collision (the feeler at 0x3560) and trick state - none of it
+// pose or camera data, so it is bytes to step over rather than types to
+// transcribe.
 #[repr(C)]
 pub struct CSkater {
     _pad_000: [u8; 0x608],
     pub model: *mut CModel, // 0x0608
     _pad_60c: [u8; 0x28],
     pub object: *mut CCompositeObject, // 0x0634
-    _pad_638: [u8; 0x148],
-    pub pad: CSkaterPad, // 0x0780
-    _pad_978: [u8; 2],
-    pub input_disabled: u8, // 0x097a
-    _pad_97b: [u8; 0x1db9],
-    pub doing_balance_trick: u8, // 0x2734
-    _pad_2735: [u8; 0xe2b],
-    pub feeler: CFeeler, // 0x3560
-    _pad_35fc: [u8; 0x184],
-    pub current_normal: MthVector, // 0x3780
-    _pad_3790: [u8; 0x34],
+    _pad_638: [u8; 0x318c],
     pub view_mode: u32, // 0x37c4
     _pad_37c8: [u8; 0xc],
-    pub camera: *mut CSkaterCam, // 0x37d4
-}
-
-#[repr(C)]
-pub struct CSkaterCam {
-    _pad_000: [u8; 0xc4],
-    pub skater: *mut CSkater, // 0xc4
+    /// The skater's `CSkaterCam`, held as the handle the `Gfx_Camera`
+    /// accessors take - which is all we ever do with it.
+    pub camera: GfxCamera, // 0x37d4
 }
 
 pub type GfxCamera = usize;
@@ -185,3 +135,38 @@ pub unsafe fn gfx_camera_set_matrix(camera: GfxCamera, matrix: &MthMatrix) {
     unsafe { func(camera, matrix) };
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    // Padding is the only thing holding these fields in place, so the offsets
+    // the comments claim are asserted. 32-bit pointers assumed - the whole
+    // workspace builds for i686.
+
+    #[test]
+    fn mth_sizes() {
+        assert_eq!(size_of::<MthVector>(), 0x10);
+        assert_eq!(size_of::<MthMatrix>(), 0x40);
+    }
+
+    #[test]
+    fn composite_object_layout() {
+        assert_eq!(offset_of!(CCompositeObject, position), 0x00);
+        assert_eq!(offset_of!(CCompositeObject, matrix), 0x40);
+        assert_eq!(size_of::<CCompositeObject>(), 0x80);
+    }
+
+    #[test]
+    fn model_layout() {
+        assert_eq!(offset_of!(CModel, skeleton), 0x08);
+    }
+
+    #[test]
+    fn skater_layout() {
+        assert_eq!(offset_of!(CSkater, model), 0x608);
+        assert_eq!(offset_of!(CSkater, object), 0x634);
+        assert_eq!(offset_of!(CSkater, view_mode), 0x37c4);
+        assert_eq!(offset_of!(CSkater, camera), 0x37d4);
+    }
+}

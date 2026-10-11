@@ -1,25 +1,28 @@
 # falke
-A tool for movie making enhancements in THUG Pro.
+A tool for movie making enhancements for Neversofts Tony Hawk's Pro Skater series.
 
 ## Features
-- Enhances the Free Cam of THUG Pro (THUG2 Mod) to play interpolated Camera Paths between placeable snapshots (supports Transform, Rotation and FOV)
+- Enhances the Free Cam of Tony Hawk's Pro Skater games to play interpolated Camera Paths between placeable snapshots (supports Transform, Rotation and FOV).
+Also adds basic replay functionality.
 
 ## Installation
-I recommend using the "Ultimate ASI Loader" to inject the falke.dll into the THUG Pro Process.
+I recommend using the "Ultimate ASI Loader" to inject the falke.dll into the necessary process.
+Installation might differ for games.
 
-### Using Ultimate ASI Loader
-For convenience I've put the files directly inside the folder.
-Place them next to your THUGPro.exe
+### Simple way (bundled)
+Just download the release zip and put it inside your `Game` folder.
 
-If you want to do it yourself:
-1. Download the 32Bit Version of "dinput8.dll" [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases).
-2. Put the dinput8.dll next to your THUG Pro executable.
-3. Put the "falke.asi" into a "plugins" folder, next to your THUG Pro Installation (f.e: C:\Users\YourUsername\AppData\Local\THUG Pro\plugins\falke.asi).
+### From source (code, not me).
+You have to build the .dll with cargo. You must inject it to the process (by using Ultimate ASI Loader f.e.).
+For THPS4 you also need my d3d8to9 fork (https://github.com/sourcethps/d3d8to9) as the game is in Direct3D 8.
+Put that as d3d8.dll and ASI Loader as dinput8.dll
 
-Additional Note: If you want to use Reshade you can just rename the Reshade DLL to "reshade.asi" and also put it there.
+## Troubleshooting
+If something goes wrong, you need to provide a falke.log file.
 
-### Using a DLL Injector
-Alternatively you can use any DLL Injector or probably the old "falke.exe" (if you still have an older release).
+### Using Reshade with this
+If you use Ultimate ASI Loader, you can just put reshade as reshade.asi inside the plugins folder.
+For THPS4 you need to use d3d8to9 as Reshade only works with Direct3D 9.
 
 ## How-To
 The overlay should show once you move the camera in free cam mode.
@@ -32,11 +35,8 @@ For playing the path hit the **SPACE** Key.
 
 Press **F1** to toggle the UI. This is useful when recording. I advise to put the playtime marker a couple of seconds before the first keyframe, press play (Space) and toggle the UI (F1) when you want to record.
 
-## FAQ
-**Q: Is this compatible with THUG2?**
-
-A: While this is possible, currently it is not compatible and support is not planned
-
 ## Known Issues
-- Alt-Tabbing restores overlay window positions (won't fix for now)
 - If the overlay doesn't show, try restarting the game
+- When in replay, the stance and board state matters.
+Your board is missing? Get out of freecam, get on the board, go into the replay again.
+Your tricks spin wrong? Get out of freecam, change your stance, go into the replay again.

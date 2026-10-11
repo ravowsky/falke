@@ -277,7 +277,7 @@ fn skater() -> Option<*mut CSkater> {
 }
 
 fn camera_obj() -> Option<GfxCamera> {
-    let camera = unsafe { (*skater()?).camera } as GfxCamera;
+    let camera = unsafe { (*skater()?).camera };
     (camera != 0).then_some(camera)
 }
 
@@ -360,7 +360,7 @@ fn hk_do_freecam_logic(skater: *mut CSkater) {
                 "[THPS4] first freecam tick: CSkater=0x{:x} view_mode={} CSkaterCam=0x{:x}",
                 skater as usize,
                 (*skater).view_mode,
-                (*skater).camera as usize,
+                (*skater).camera,
             );
         }
     }
