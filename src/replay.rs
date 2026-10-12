@@ -1,6 +1,7 @@
 use std::{
     io::{BufWriter, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -10,8 +11,18 @@ use crate::{
     math::{Quat, Vec3, lerp_arr},
 };
 
-const FLK_REPLAY_VERSION: u8 = 3;
+const FLK_REPLAY_VERSION: u8 = 4;
 const REPLAY_FOLDER: &str = "Replays";
+const REPLAY_EXTENSION: &str = "flk";
+
+/// Capture rate assumed for a replay that was too short to measure one.
+pub const DEFAULT_FPS: f32 = 60.0;
+
+/// Range a measured capture rate is believed in, outside which the default wins.
+const FPS_RANGE: std::ops::RangeInclusive<f32> = 1.0..=1000.0;
+
+const OFFSET_FRAME_COUNT: u64 = 1;
+const OFFSET_FPS: u64 = OFFSET_FRAME_COUNT + 8;
 
 /// Room for the largest skeleton any supported game has (currently THPS4 with 55).
 pub const MAX_BONES: usize = 55;
@@ -20,6 +31,10 @@ pub struct Replay {
     file_path: PathBuf,
     writer: Option<BufWriter<std::fs::File>>,
     frame_count: u64,
+    /// Bracket the recording, so the rate is measured rather than assumed: one
+    /// frame goes out per EndScene, at whatever rate the game happens to run.
+    first_frame_at: Option<Instant>,
+    last_frame_at: Option<Instant>,
 }
 
 /// One skater's pose for a single frame.
@@ -47,12 +62,20 @@ pub struct ReplayState {
     pub camera: Option<CameraPose>,
 }
 
+pub fn replay_path(name: &str) -> PathBuf {
+    PathBuf::from(REPLAY_FOLDER)
+        .join(name)
+        .with_extension(REPLAY_EXTENSION)
+}
+
 impl Replay {
     pub fn new(name: &str) -> Self {
         Self {
-            file_path: PathBuf::from(REPLAY_FOLDER).join(name.to_owned() + ".flk"),
+            file_path: replay_path(name),
             writer: None,
             frame_count: 0,
+            first_frame_at: None,
+            last_frame_at: None,
         }
     }
 
@@ -66,10 +89,30 @@ impl Replay {
             std::fs::File::create(&self.file_path).context("failed to create replay file")?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&[FLK_REPLAY_VERSION])?;
-        // Placeholder: frame count will be written in finish().
+        // Patched in by finish(), once both are known.
         writer.write_all(&0u64.to_le_bytes())?;
+        writer.write_all(&0f32.to_le_bytes())?;
         self.writer = Some(writer);
         Ok(())
+    }
+
+    /// Frames per second over the whole recording, or the default where there
+    /// was too little of it to measure.
+    pub fn measured_fps(&self) -> f32 {
+        let (Some(first), Some(last)) = (self.first_frame_at, self.last_frame_at) else {
+            return DEFAULT_FPS;
+        };
+        let elapsed = (last - first).as_secs_f32();
+        if self.frame_count < 2 || elapsed <= 0.0 {
+            return DEFAULT_FPS;
+        }
+        // n frames span n-1 intervals.
+        let fps = (self.frame_count - 1) as f32 / elapsed;
+        if FPS_RANGE.contains(&fps) {
+            fps
+        } else {
+            DEFAULT_FPS
+        }
     }
 
     /// Writes one captured frame to disk and advances the frame counter.
@@ -108,20 +151,27 @@ impl Replay {
             None => writer.write_all(&[0])?,
         }
         self.frame_count += 1;
+        let now = Instant::now();
+        self.first_frame_at.get_or_insert(now);
+        self.last_frame_at = Some(now);
         Ok(())
     }
 
-    /// Flushes the writer and patches the frame count into the file header.
+    /// Flush the writer and patch the frame count and capture rate into the header.
     pub fn finish(&mut self) -> Result<()> {
         if let Some(writer) = self.writer.take() {
+            let fps = self.measured_fps();
             let mut file = writer
                 .into_inner()
                 .map_err(|e| anyhow::anyhow!("flush failed: {}", e.error()))?;
-            file.seek(SeekFrom::Start(1))?;
+            file.seek(SeekFrom::Start(OFFSET_FRAME_COUNT))?;
             file.write_all(&self.frame_count.to_le_bytes())?;
+            file.seek(SeekFrom::Start(OFFSET_FPS))?;
+            file.write_all(&fps.to_le_bytes())?;
             log::info!(
-                "replay saved: {} frames → {:?}",
+                "replay saved: {} frames at {:.1} fps → {:?}",
                 self.frame_count,
+                fps,
                 self.file_path
             );
         }
@@ -133,29 +183,109 @@ impl Replay {
     }
 }
 
+/// What a replay's header says about it, without reading the frames.
+#[derive(Clone, Debug)]
+pub struct ReplayInfo {
+    pub name: String,
+    pub frame_count: u64,
+    pub fps: f32,
+}
+
+impl ReplayInfo {
+    pub fn duration(&self) -> f32 {
+        duration_of(self.frame_count, self.fps)
+    }
+}
+
+/// Every replay in the folder, in name order. An unreadable file is logged and
+/// skipped rather than failing the listing, so one bad file cannot hide the rest.
+pub fn list() -> Vec<ReplayInfo> {
+    let dir = Path::new(REPLAY_FOLDER);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(REPLAY_EXTENSION) {
+            continue;
+        }
+        let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        match read_header(&path) {
+            Ok((frame_count, fps)) => out.push(ReplayInfo {
+                name,
+                frame_count,
+                fps,
+            }),
+            Err(e) => log::warn!("skipping replay {name}: {e}"),
+        }
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+fn read_header(path: &Path) -> Result<(u64, f32)> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open replay file: {path:?}"))?;
+    read_header_from(&mut file)
+}
+
+fn read_header_from(file: &mut std::fs::File) -> Result<(u64, f32)> {
+    let mut version = [0u8; 1];
+    file.read_exact(&mut version)
+        .context("failed to read replay version")?;
+    if version[0] != FLK_REPLAY_VERSION {
+        anyhow::bail!(
+            "unsupported replay version: {} (this build reads {FLK_REPLAY_VERSION})",
+            version[0]
+        );
+    }
+
+    let mut frame_count_bytes = [0u8; 8];
+    file.read_exact(&mut frame_count_bytes)
+        .context("failed to read frame count")?;
+    let mut fps_bytes = [0u8; 4];
+    file.read_exact(&mut fps_bytes)
+        .context("failed to read capture rate")?;
+
+    let fps = f32::from_le_bytes(fps_bytes);
+    // A recording that was cut off never had its header patched, so the rate
+    // reads back as zero. Playing it at the default beats dividing by it.
+    let fps = if FPS_RANGE.contains(&fps) {
+        fps
+    } else {
+        DEFAULT_FPS
+    };
+    Ok((u64::from_le_bytes(frame_count_bytes), fps))
+}
+
+fn duration_of(frame_count: u64, fps: f32) -> f32 {
+    if fps > 0.0 {
+        frame_count as f32 / fps
+    } else {
+        0.0
+    }
+}
+
 pub struct LoadedReplay {
     pub name: String,
     pub frame_count: u64,
+    /// The rate it was captured at, which is the rate playback has to advance
+    /// through it at. A game running at 30 or 144 would otherwise play wrong.
+    pub fps: f32,
     pub frames: Vec<ReplayState>,
 }
 
 impl LoadedReplay {
     pub fn load(name: &str) -> Result<Self> {
-        let file_path = PathBuf::from(REPLAY_FOLDER).join(name.to_owned() + ".flk");
+        let file_path = replay_path(name);
         let mut file = std::fs::File::open(&file_path)
             .with_context(|| format!("failed to open replay file: {:?}", file_path))?;
 
-        let mut version = [0u8; 1];
-        file.read_exact(&mut version)
-            .context("failed to read replay version")?;
-        if version[0] != FLK_REPLAY_VERSION {
-            anyhow::bail!("unsupported replay version: {}", version[0]);
-        }
-
-        let mut frame_count_bytes = [0u8; 8];
-        file.read_exact(&mut frame_count_bytes)
-            .context("failed to read frame count")?;
-        let frame_count = u64::from_le_bytes(frame_count_bytes);
+        let (frame_count, fps) = read_header_from(&mut file)?;
 
         let mut frames = Vec::with_capacity(frame_count as usize);
 
@@ -215,16 +345,28 @@ impl LoadedReplay {
         Ok(Self {
             name: name.to_owned(),
             frame_count,
+            fps,
             frames,
         })
     }
 
-    pub fn get_frame(&self, index: usize) -> Option<&ReplayState> {
-        self.frames.get(index)
+    pub fn duration(&self) -> f32 {
+        duration_of(self.frame_count, self.fps)
+    }
+
+    /// Clamped to the last frame.
+    pub fn frame_index_at(&self, seconds: f32) -> usize {
+        let last = self.frames.len().saturating_sub(1);
+        ((seconds.max(0.0) * self.fps) as usize).min(last)
+    }
+
+    /// Sample the replay `seconds` into it, at its own capture rate.
+    pub fn sample_at(&self, seconds: f32) -> Option<ReplayState> {
+        self.sample(seconds * self.fps)
     }
 
     /// Sample the replay at a fractional frame index, interpolating between the
-    /// two surrounding frames. `t` is in frame units (seconds * 60).
+    /// two surrounding frames. `t` is in frame units, so `seconds * fps`.
     pub fn sample(&self, t: f32) -> Option<ReplayState> {
         if self.frames.is_empty() {
             return None;

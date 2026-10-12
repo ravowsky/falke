@@ -1,5 +1,14 @@
 # Changelog
 
+0.7.0
+===
+- Fixing inconsistencies in UX
+- Camera dirty state is now derived from difference to keyframe data
+  - Show what is changed and provide Apply and Reset Buttons
+- Separated "Play" and "Fly" mode
+- "Playback mode" is now the better fitting "Preview on scrub" option
+- Improved Replay loading UI
+
 0.6.0
 ===
 - Add THPS4(Better4) compatibility for keyframing and replays

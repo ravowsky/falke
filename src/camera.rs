@@ -374,6 +374,21 @@ impl OrbitCamera {
         }
     }
 
+    /// The orbit that puts the camera at `eye` circling `pivot`, for when the
+    /// pivot is already known. `from_pose` has to guess one out in front.
+    pub fn from_eye(eye: Vec3, pivot: Vec3, aim_height: f32) -> Self {
+        let offset = glm::Vec3::from(eye) - glm::Vec3::from(pivot);
+        let distance = offset.norm().max(Self::MIN_DISTANCE);
+        Self {
+            // With no skater, `pivot` is read straight back off `target`.
+            target: pivot,
+            yaw: offset.x.atan2(offset.z),
+            pitch: (offset.y / distance).clamp(-1.0, 1.0).asin(),
+            distance,
+            aim_height,
+        }
+    }
+
     /// Keep an existing aim height across a rebuild from a pose.
     pub fn with_aim_height(mut self, aim_height: f32) -> Self {
         self.aim_height = aim_height;
