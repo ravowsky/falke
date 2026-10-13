@@ -5,6 +5,7 @@ Supported games:
 - THUGPro (THUG2 mod)
 - Better4 (THPS4 mod)
 
+<img width="952" height="538" alt="falke" src="https://github.com/user-attachments/assets/fb554204-9fb3-4e09-b37b-ac116d1396f3" />
 
 ## Features
 - Enhances the Free Cam to play interpolated camera paths between placeable keyframes
