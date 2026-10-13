@@ -6,6 +6,7 @@ mod game;
 mod logger;
 mod math;
 mod replay;
+mod thaw;
 mod thps4;
 mod thug2;
 mod ui;

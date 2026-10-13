@@ -3,7 +3,7 @@ members = [".", "thps-rs", "thps-rs/crates/thug2", "thps-rs/crates/thps4", "thps
 
 [package]
 name = "falke"
-version = "0.7.0"
+version = "0.6.0"
 edition = "2024"
 
 [lib]
@@ -20,10 +20,10 @@ egui = "0.31.0"
 egui-d3d9 = { git = "https://github.com/sourcethps/egui-d3d9", branch = "feature/fix-alt-tab-crash" }
 nalgebra-glm = "0.20.0"
 toy-arms = {git = "https://github.com/vxcall/toy-arms"}
+
 [build-dependencies]
-vergen = { version = "9.0.0", features = ["build"] }
+vergen = "=9.0.6"
 vergen-git2 = "1.0.7"
-vergen-lib = "0.1.6"
 anyhow = "1.0.98"
 
 [dependencies.egui_extras]

@@ -1,13 +1,28 @@
 # Changelog
 
-0.7.0
+Unreleased
 ===
-- Fixing inconsistencies in UX
-- Camera dirty state is now derived from difference to keyframe data
-  - Show what is changed and provide Apply and Reset Buttons
-- Separated "Play" and "Fly" mode
-- "Playback mode" is now the better fitting "Preview on scrub" option
-- Improved Replay loading UI
+- Add THAW / reTHAWed compatibility (`thaw.exe`, `rethawed.exe`)
+  - Freecam keyframing and camera paths, including FOV
+  - Replays record the skater, the camera, cars and pedestrians
+  - Skater replays play back in freecam
+  - Crashes and panics are written to falke.log with the game code that was running
+- Replay window is available outside freecam, so a recording can be named and started while skating
+- Playback speed now also slows down the game world (THAW): traffic, pedestrians and particles follow the replay at 0.1x
+- Smooth slow-motion skater playback (THAW)
+  - Bones are blended in world space, so turns the game undoes in one frame (switch/fakie landings) no longer swing the body around
+  - Animation cuts and wallride/landing transitions are eased out instead of snapping
+  - Joints stay connected while blending, no more stretched arms or exploding hands
+- Cars, pedestrians and other animated objects are synced to replay playback (THAW)
+  - The 24 pedestrians and 24 other animated objects nearest to the skater are recorded
+  - Cars that were not recorded are hidden during playback
+  - Only syncs for replays recorded in the current game session
+- Experimental: sync moving objects without a skeleton, such as cranes and crates (THAW), switched on in the Replay window
+- The game world stands still while a replay is paused in freecam (THAW)
+- Generic replay interpolation no longer blends across 180° flips and animation cuts (shows the nearer frame instead)
+- Replay format version 4: cars and pedestrians are stored at half precision, about 45% smaller files; version 3 replays still load
+- Faster replay loading
+- Game backends can provide their own skater blending and world time scale
 
 0.6.0
 ===

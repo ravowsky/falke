@@ -1,8 +1,14 @@
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{camera::CameraPose, replay::ReplayState};
+use crate::{
+    camera::CameraPose,
+    replay::{ReplayState, SkaterState},
+};
 
 pub trait Game: Sync {
     /// Human-readable name, for logs.
@@ -36,6 +42,21 @@ pub trait Game: Sync {
 
     /// Set the field of view, in degrees.
     fn set_fov(&self, fov: f32);
+
+    /// Run the game world (traffic, pedestrians, particles) at `scale` times normal speed,
+    /// so it follows the replay's playback speed. 1.0 is normal. Optional per game.
+    fn set_time_scale(&self, _scale: f32) {}
+
+    /// Build the skaters between recorded frames `i0` and `i0 + 1` (`frac` 0..1) when the
+    /// game stores them in a way the generic interpolation cannot blend. `None` = generic.
+    fn blend_skaters(
+        &self,
+        _frames: &[ReplayState],
+        _i0: usize,
+        _frac: f32,
+    ) -> Option<Vec<SkaterState>> {
+        None
+    }
 }
 
 static GAME: OnceLock<&'static dyn Game> = OnceLock::new();
@@ -51,6 +72,7 @@ fn detect() -> Result<&'static dyn Game> {
     match name.as_str() {
         "thugpro.exe" | "thug2.exe" => Ok(&crate::thug2::Thug2),
         "thps4.exe" | "better4.exe" => Ok(&crate::thps4::Thps4),
+        "thaw.exe" | "rethawed.exe" => Ok(&crate::thaw::Thaw),
         other => bail!("unsupported game executable: {other}"),
     }
 }
@@ -99,4 +121,28 @@ pub fn set_fov(fov: f32) {
     if let Some(g) = current() {
         g.set_fov(fov);
     }
+}
+
+/// Blend two recorded frames' skaters the backend's way, if it has one.
+pub fn blend_skaters(frames: &[ReplayState], i0: usize, frac: f32) -> Option<Vec<SkaterState>> {
+    current().and_then(|g| g.blend_skaters(frames, i0, frac))
+}
+
+/// Run the game world at `scale` times normal speed (1.0 = normal).
+pub fn set_time_scale(scale: f32) {
+    if let Some(g) = current() {
+        g.set_time_scale(scale);
+    }
+}
+
+/// Experimental: replay moving objects drawn without a skeleton (cranes, crates, trains)
+/// too, where the game supports it. Off by default, switched in the Replay window.
+static SYNC_MOVING_OBJECTS: AtomicBool = AtomicBool::new(false);
+
+pub fn sync_moving_objects() -> bool {
+    SYNC_MOVING_OBJECTS.load(Ordering::Relaxed)
+}
+
+pub fn set_sync_moving_objects(on: bool) {
+    SYNC_MOVING_OBJECTS.store(on, Ordering::Relaxed);
 }

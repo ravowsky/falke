@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::{dx_hooks, game, logger};
 
-pub const FALKE_VERSION: &str = "0.7.0";
+pub const FALKE_VERSION: &str = "0.6.0";
 
 pub fn main() -> Result<()> {
     setup_logger()?;

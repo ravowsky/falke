@@ -1,0 +1,61 @@
+--- /tmp/ui_orig.rs	2026-10-11 21:33:39.736073170 +0000
++++ src/ui.rs	2026-10-11 21:33:39.804222862 +0000
+@@ -416,14 +416,13 @@
+ }
+ 
+ impl UiSystem {
++    /// Whether the overlay (F1) is switched on. The Replay window follows this in
++    /// any camera mode; the authoring panels additionally need the freecam.
+     pub fn is_showing(&self) -> bool {
+-        self.is_showing && game::in_freecam()
++        self.is_showing
+     }
+ 
+     pub fn toggle_showing(&mut self) {
+-        if !game::in_freecam() {
+-            return;
+-        }
+         self.is_showing = !self.is_showing;
+     }
+ 
+@@ -1452,20 +1451,27 @@
+     }
+     let just_opened = !std::mem::replace(&mut ui.was_showing, true);
+ 
+-    // No camera yet means freecam has never been entered, so there is nothing
+-    // to author against.
+-    if has_camera {
+-        ctx.debug_painter().text(
+-            Pos2::new(0., 0.),
+-            Align2::LEFT_TOP,
+-            version_string(),
+-            FontId::default(),
+-            Color32::LIGHT_YELLOW,
+-        );
++    ctx.debug_painter().text(
++        Pos2::new(0., 0.),
++        Align2::LEFT_TOP,
++        version_string(),
++        FontId::default(),
++        Color32::LIGHT_YELLOW,
++    );
++
++    // The path and camera panels only make sense in the freecam. No camera yet
++    // means freecam has never been entered, so there is nothing to author against.
++    let authoring = game::in_freecam() && has_camera;
++
++    if authoring {
+         ui.update_timeline(ctx);
+-        if replay_available {
+-            ui.update_replay_detail(ctx);
+-        }
++    }
++    // The Replay window works in any camera mode, so a recording can be named and
++    // started while skating, not only from the freecam.
++    if replay_available {
++        ui.update_replay_detail(ctx);
++    }
++    if authoring {
+         ui.update_keyframe_detail(ctx);
+         ui.update_orbit_input(ctx);
+     }

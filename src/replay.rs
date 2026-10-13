@@ -1,7 +1,6 @@
 use std::{
-    io::{BufWriter, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-    time::Instant,
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    path::PathBuf,
 };
 
 use anyhow::{Context, Result};
@@ -11,18 +10,11 @@ use crate::{
     math::{Quat, Vec3, lerp_arr},
 };
 
+/// 4: like 3, but entries flagged in their bone count byte (0x80) store their bones at half
+/// precision. Version 3 files still load.
 const FLK_REPLAY_VERSION: u8 = 4;
+const HALF_FLAG: u8 = 0x80;
 const REPLAY_FOLDER: &str = "Replays";
-const REPLAY_EXTENSION: &str = "flk";
-
-/// Capture rate assumed for a replay that was too short to measure one.
-pub const DEFAULT_FPS: f32 = 60.0;
-
-/// Range a measured capture rate is believed in, outside which the default wins.
-const FPS_RANGE: std::ops::RangeInclusive<f32> = 1.0..=1000.0;
-
-const OFFSET_FRAME_COUNT: u64 = 1;
-const OFFSET_FPS: u64 = OFFSET_FRAME_COUNT + 8;
 
 /// Room for the largest skeleton any supported game has (currently THPS4 with 55).
 pub const MAX_BONES: usize = 55;
@@ -31,10 +23,6 @@ pub struct Replay {
     file_path: PathBuf,
     writer: Option<BufWriter<std::fs::File>>,
     frame_count: u64,
-    /// Bracket the recording, so the rate is measured rather than assumed: one
-    /// frame goes out per EndScene, at whatever rate the game happens to run.
-    first_frame_at: Option<Instant>,
-    last_frame_at: Option<Instant>,
 }
 
 /// One skater's pose for a single frame.
@@ -53,6 +41,14 @@ impl SkaterState {
     pub fn bones(&self) -> usize {
         (self.bone_count as usize).min(MAX_BONES)
     }
+
+    /// Extra entries a game backend adds besides the skater (traffic, people) mark
+    /// themselves with a large number (1000 or more) in the otherwise zero fourth column of
+    /// the world matrix. Their bones are stored at half precision, which is plenty for
+    /// background objects and halves their size; the skater keeps full precision.
+    pub fn compact(&self) -> bool {
+        self.world_matrix[3] >= 1000.0
+    }
 }
 
 /// One frame of a replay.
@@ -62,20 +58,12 @@ pub struct ReplayState {
     pub camera: Option<CameraPose>,
 }
 
-pub fn replay_path(name: &str) -> PathBuf {
-    PathBuf::from(REPLAY_FOLDER)
-        .join(name)
-        .with_extension(REPLAY_EXTENSION)
-}
-
 impl Replay {
     pub fn new(name: &str) -> Self {
         Self {
-            file_path: replay_path(name),
+            file_path: PathBuf::from(REPLAY_FOLDER).join(name.to_owned() + ".flk"),
             writer: None,
             frame_count: 0,
-            first_frame_at: None,
-            last_frame_at: None,
         }
     }
 
@@ -89,30 +77,10 @@ impl Replay {
             std::fs::File::create(&self.file_path).context("failed to create replay file")?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&[FLK_REPLAY_VERSION])?;
-        // Patched in by finish(), once both are known.
+        // Placeholder: frame count will be written in finish().
         writer.write_all(&0u64.to_le_bytes())?;
-        writer.write_all(&0f32.to_le_bytes())?;
         self.writer = Some(writer);
         Ok(())
-    }
-
-    /// Frames per second over the whole recording, or the default where there
-    /// was too little of it to measure.
-    pub fn measured_fps(&self) -> f32 {
-        let (Some(first), Some(last)) = (self.first_frame_at, self.last_frame_at) else {
-            return DEFAULT_FPS;
-        };
-        let elapsed = (last - first).as_secs_f32();
-        if self.frame_count < 2 || elapsed <= 0.0 {
-            return DEFAULT_FPS;
-        }
-        // n frames span n-1 intervals.
-        let fps = (self.frame_count - 1) as f32 / elapsed;
-        if FPS_RANGE.contains(&fps) {
-            fps
-        } else {
-            DEFAULT_FPS
-        }
     }
 
     /// Writes one captured frame to disk and advances the frame counter.
@@ -128,14 +96,22 @@ impl Replay {
             // Only the bones this skeleton has: the arrays are sized for the
             // largest game, not for the one being recorded.
             let bones = skater.bones();
-            writer.write_all(&[bones as u8])?;
+            let half = skater.compact();
+            writer.write_all(&[bones as u8 | if half { HALF_FLAG } else { 0 }])?;
             write_f32s(writer, &skater.world_pos)?;
             write_f32s(writer, &skater.world_matrix)?;
+            let write = |w: &mut BufWriter<std::fs::File>, v: &[f32]| {
+                if half {
+                    write_f16s(w, v)
+                } else {
+                    write_f32s(w, v)
+                }
+            };
             for quat in &skater.bone_quats[..bones] {
-                write_f32s(writer, quat)?;
+                write(writer, quat)?;
             }
             for trans in &skater.bone_trans[..bones] {
-                write_f32s(writer, trans)?;
+                write(writer, trans)?;
             }
         }
         // Camera: a presence byte, then the pose. A frame recorded before the
@@ -151,27 +127,20 @@ impl Replay {
             None => writer.write_all(&[0])?,
         }
         self.frame_count += 1;
-        let now = Instant::now();
-        self.first_frame_at.get_or_insert(now);
-        self.last_frame_at = Some(now);
         Ok(())
     }
 
-    /// Flush the writer and patch the frame count and capture rate into the header.
+    /// Flushes the writer and patches the frame count into the file header.
     pub fn finish(&mut self) -> Result<()> {
         if let Some(writer) = self.writer.take() {
-            let fps = self.measured_fps();
             let mut file = writer
                 .into_inner()
                 .map_err(|e| anyhow::anyhow!("flush failed: {}", e.error()))?;
-            file.seek(SeekFrom::Start(OFFSET_FRAME_COUNT))?;
+            file.seek(SeekFrom::Start(1))?;
             file.write_all(&self.frame_count.to_le_bytes())?;
-            file.seek(SeekFrom::Start(OFFSET_FPS))?;
-            file.write_all(&fps.to_le_bytes())?;
             log::info!(
-                "replay saved: {} frames at {:.1} fps → {:?}",
+                "replay saved: {} frames → {:?}",
                 self.frame_count,
-                fps,
                 self.file_path
             );
         }
@@ -183,109 +152,34 @@ impl Replay {
     }
 }
 
-/// What a replay's header says about it, without reading the frames.
-#[derive(Clone, Debug)]
-pub struct ReplayInfo {
-    pub name: String,
-    pub frame_count: u64,
-    pub fps: f32,
-}
-
-impl ReplayInfo {
-    pub fn duration(&self) -> f32 {
-        duration_of(self.frame_count, self.fps)
-    }
-}
-
-/// Every replay in the folder, in name order. An unreadable file is logged and
-/// skipped rather than failing the listing, so one bad file cannot hide the rest.
-pub fn list() -> Vec<ReplayInfo> {
-    let dir = Path::new(REPLAY_FOLDER);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some(REPLAY_EXTENSION) {
-            continue;
-        }
-        let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
-            continue;
-        };
-        match read_header(&path) {
-            Ok((frame_count, fps)) => out.push(ReplayInfo {
-                name,
-                frame_count,
-                fps,
-            }),
-            Err(e) => log::warn!("skipping replay {name}: {e}"),
-        }
-    }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    out
-}
-
-fn read_header(path: &Path) -> Result<(u64, f32)> {
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("failed to open replay file: {path:?}"))?;
-    read_header_from(&mut file)
-}
-
-fn read_header_from(file: &mut std::fs::File) -> Result<(u64, f32)> {
-    let mut version = [0u8; 1];
-    file.read_exact(&mut version)
-        .context("failed to read replay version")?;
-    if version[0] != FLK_REPLAY_VERSION {
-        anyhow::bail!(
-            "unsupported replay version: {} (this build reads {FLK_REPLAY_VERSION})",
-            version[0]
-        );
-    }
-
-    let mut frame_count_bytes = [0u8; 8];
-    file.read_exact(&mut frame_count_bytes)
-        .context("failed to read frame count")?;
-    let mut fps_bytes = [0u8; 4];
-    file.read_exact(&mut fps_bytes)
-        .context("failed to read capture rate")?;
-
-    let fps = f32::from_le_bytes(fps_bytes);
-    // A recording that was cut off never had its header patched, so the rate
-    // reads back as zero. Playing it at the default beats dividing by it.
-    let fps = if FPS_RANGE.contains(&fps) {
-        fps
-    } else {
-        DEFAULT_FPS
-    };
-    Ok((u64::from_le_bytes(frame_count_bytes), fps))
-}
-
-fn duration_of(frame_count: u64, fps: f32) -> f32 {
-    if fps > 0.0 {
-        frame_count as f32 / fps
-    } else {
-        0.0
-    }
-}
-
 pub struct LoadedReplay {
     pub name: String,
     pub frame_count: u64,
-    /// The rate it was captured at, which is the rate playback has to advance
-    /// through it at. A game running at 30 or 144 would otherwise play wrong.
-    pub fps: f32,
     pub frames: Vec<ReplayState>,
 }
 
 impl LoadedReplay {
     pub fn load(name: &str) -> Result<Self> {
-        let file_path = replay_path(name);
-        let mut file = std::fs::File::open(&file_path)
-            .with_context(|| format!("failed to open replay file: {:?}", file_path))?;
+        let file_path = PathBuf::from(REPLAY_FOLDER).join(name.to_owned() + ".flk");
+        // Buffered: a frame is read in hundreds of small pieces.
+        let mut file = BufReader::with_capacity(
+            1 << 20,
+            std::fs::File::open(&file_path)
+                .with_context(|| format!("failed to open replay file: {:?}", file_path))?,
+        );
 
-        let (frame_count, fps) = read_header_from(&mut file)?;
+        let mut version = [0u8; 1];
+        file.read_exact(&mut version)
+            .context("failed to read replay version")?;
+        let version = version[0];
+        if version != 3 && version != FLK_REPLAY_VERSION {
+            anyhow::bail!("unsupported replay version: {version}");
+        }
+
+        let mut frame_count_bytes = [0u8; 8];
+        file.read_exact(&mut frame_count_bytes)
+            .context("failed to read frame count")?;
+        let frame_count = u64::from_le_bytes(frame_count_bytes);
 
         let mut frames = Vec::with_capacity(frame_count as usize);
 
@@ -298,7 +192,12 @@ impl LoadedReplay {
             for _ in 0..skater_count {
                 let mut bone_count = [0u8; 1];
                 file.read_exact(&mut bone_count)?;
-                let bone_count = bone_count[0];
+                let half = version >= 4 && bone_count[0] & HALF_FLAG != 0;
+                let bone_count = if version >= 4 {
+                    bone_count[0] & !HALF_FLAG
+                } else {
+                    bone_count[0]
+                };
                 if bone_count as usize > MAX_BONES {
                     anyhow::bail!(
                         "replay wants {bone_count} bones per skater, more than the {MAX_BONES} a frame holds"
@@ -310,11 +209,26 @@ impl LoadedReplay {
 
                 let mut bone_quats = [[0f32; 4]; MAX_BONES];
                 for quat in bone_quats[..bone_count as usize].iter_mut() {
-                    *quat = read_f32s::<4>(&mut file)?;
+                    if half {
+                        // Back to unit length after the rounding.
+                        let q = read_f16s::<4>(&mut file)?;
+                        let len = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        *quat = if len > 0.0 {
+                            q.map(|x| x / len)
+                        } else {
+                            [0.0, 0.0, 0.0, 1.0]
+                        };
+                    } else {
+                        *quat = read_f32s::<4>(&mut file)?;
+                    }
                 }
                 let mut bone_trans = [[0f32; 4]; MAX_BONES];
                 for trans in bone_trans[..bone_count as usize].iter_mut() {
-                    *trans = read_f32s::<4>(&mut file)?;
+                    *trans = if half {
+                        read_f16s::<4>(&mut file)?
+                    } else {
+                        read_f32s::<4>(&mut file)?
+                    };
                 }
 
                 skaters.push(SkaterState {
@@ -345,44 +259,69 @@ impl LoadedReplay {
         Ok(Self {
             name: name.to_owned(),
             frame_count,
-            fps,
             frames,
         })
     }
 
-    pub fn duration(&self) -> f32 {
-        duration_of(self.frame_count, self.fps)
+    pub fn get_frame(&self, index: usize) -> Option<&ReplayState> {
+        self.frames.get(index)
     }
 
-    /// Clamped to the last frame.
-    pub fn frame_index_at(&self, seconds: f32) -> usize {
-        let last = self.frames.len().saturating_sub(1);
-        ((seconds.max(0.0) * self.fps) as usize).min(last)
+    /// Like `sample`, but lets the game backend build the skaters itself from the frames
+    /// around `t` (`blend(frames, i0, frac)`; `None` = generic interpolation).
+    pub fn sample_with(
+        &self,
+        t: f32,
+        blend: impl Fn(&[ReplayState], usize, f32) -> Option<Vec<SkaterState>>,
+    ) -> Option<ReplayState> {
+        let (i0, i1, frac) = self.locate(t)?;
+        if i0 != i1 {
+            if let Some(skaters) = blend(&self.frames, i0, frac) {
+                let camera = lerp_camera(&self.frames[i0], &self.frames[i1], frac);
+                return Some(ReplayState { skaters, camera });
+            }
+        }
+        self.sample(t)
     }
 
-    /// Sample the replay `seconds` into it, at its own capture rate.
-    pub fn sample_at(&self, seconds: f32) -> Option<ReplayState> {
-        self.sample(seconds * self.fps)
+    /// The two frames around `t` (in frame units) and how far between them it is.
+    fn locate(&self, t: f32) -> Option<(usize, usize, f32)> {
+        let max = self.frames.len().checked_sub(1)?;
+        let t = t.clamp(0.0, max as f32);
+        let i0 = (t as usize).min(max);
+        Some((i0, (i0 + 1).min(max), t - i0 as f32))
     }
 
     /// Sample the replay at a fractional frame index, interpolating between the
-    /// two surrounding frames. `t` is in frame units, so `seconds * fps`.
+    /// two surrounding frames. `t` is in frame units (seconds * 60).
     pub fn sample(&self, t: f32) -> Option<ReplayState> {
-        if self.frames.is_empty() {
-            return None;
-        }
-        let max = self.frames.len() - 1;
-        let t = t.clamp(0.0, max as f32);
-        let i0 = (t as usize).min(max);
-        let i1 = (i0 + 1).min(max);
-        let frac = t - i0 as f32;
-
+        let (i0, i1, frac) = self.locate(t)?;
         if i0 == i1 {
             return Some(self.frames[i0].clone());
         }
 
         let a = &self.frames[i0];
         let b = &self.frames[i1];
+
+        let camera = lerp_camera(a, b, frac);
+
+        // A jump between the two frames must not be blended: a game can flip the skater 180
+        // degrees in one frame (THAW does when landing switch/fakie), and animations can cut
+        // from one pose to another. Halfway between, there is no valid pose and the bones
+        // swing through the body, so the nearer frame is shown instead. Decided for the whole
+        // frame, because one skater can be stored as several entries that belong together.
+        // (Backends with their own blending, see `sample_with`, handle this better.)
+        let jump =
+            a.skaters.iter().zip(b.skaters.iter()).any(|(sa, sb)| {
+                rotation_jump(&sa.world_matrix, &sb.world_matrix) || pose_jump(sa, sb)
+            });
+        if jump {
+            let nearest = if frac < 0.5 { a } else { b };
+            return Some(ReplayState {
+                skaters: nearest.skaters.clone(),
+                camera,
+            });
+        }
 
         // Skaters pair up by position; a frame with fewer is the limit.
         let skaters = a
@@ -407,13 +346,50 @@ impl LoadedReplay {
             })
             .collect();
 
-        let camera = match (&a.camera, &b.camera) {
-            (Some(ca), Some(cb)) => Some(CameraPose::lerp(ca, cb, frac)),
-            (camera, _) => *camera,
-        };
-
         Some(ReplayState { skaters, camera })
     }
+}
+
+/// The camera between two frames (the earlier one's if either has none).
+fn lerp_camera(a: &ReplayState, b: &ReplayState, frac: f32) -> Option<CameraPose> {
+    match (&a.camera, &b.camera) {
+        (Some(ca), Some(cb)) => Some(CameraPose::lerp(ca, cb, frac)),
+        (camera, _) => *camera,
+    }
+}
+
+/// Whether the rotation part of two world matrices differs by more than about 45 degrees.
+fn rotation_jump(a: &[f32; 16], b: &[f32; 16]) -> bool {
+    let mut trace = 0.0;
+    for r in 0..3 {
+        let ra = [a[r * 4], a[r * 4 + 1], a[r * 4 + 2]];
+        let rb = [b[r * 4], b[r * 4 + 1], b[r * 4 + 2]];
+        let la = (ra[0] * ra[0] + ra[1] * ra[1] + ra[2] * ra[2]).sqrt();
+        let lb = (rb[0] * rb[0] + rb[1] * rb[1] + rb[2] * rb[2]).sqrt();
+        if la < 1e-4 || lb < 1e-4 {
+            return false;
+        }
+        trace += (ra[0] * rb[0] + ra[1] * rb[1] + ra[2] * rb[2]) / (la * lb);
+    }
+    // cos(angle) = (trace - 1) / 2; cos 45 degrees is about 0.707.
+    (trace - 1.0) / 2.0 < 0.707
+}
+
+/// Whether any bone turns more than 60 degrees between two frames. Normal motion stays
+/// under about 30 degrees per frame; pose cuts in THAW reach 65 to 180.
+fn pose_jump(a: &SkaterState, b: &SkaterState) -> bool {
+    let bones = a.bones().min(b.bones());
+    (0..bones).any(|i| {
+        let (p, q) = (a.bone_quats[i], b.bone_quats[i]);
+        let lp = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2] + p[3] * p[3]).sqrt();
+        let lq = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        if lp < 1e-6 || lq < 1e-6 {
+            return false;
+        }
+        let dot = ((p[0] * q[0] + p[1] * q[1] + p[2] * q[2] + p[3] * q[3]) / (lp * lq)).abs();
+        // The angle between two rotations is 2 * acos(|dot|): 60 degrees is |dot| = cos 30.
+        dot < 0.866
+    })
 }
 
 fn slerp_quat(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
@@ -429,6 +405,77 @@ fn write_f32s(w: &mut impl Write, values: &[f32]) -> Result<()> {
     Ok(())
 }
 
+fn write_f16s(w: &mut impl Write, values: &[f32]) -> Result<()> {
+    for v in values {
+        w.write_all(&f32_to_f16(*v).to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_f16s<const N: usize>(r: &mut impl Read) -> Result<[f32; N]> {
+    let mut out = [0f32; N];
+    for v in out.iter_mut() {
+        let mut buf = [0u8; 2];
+        r.read_exact(&mut buf)?;
+        *v = f16_to_f32(u16::from_le_bytes(buf));
+    }
+    Ok(out)
+}
+
+/// IEEE half precision, rounded to nearest; out-of-range values are clamped to the largest
+/// half (65504), NaN stays NaN.
+fn f32_to_f16(v: f32) -> u16 {
+    if v.is_nan() {
+        return 0x7e00;
+    }
+    let v = v.clamp(-65504.0, 65504.0);
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let man = bits & 0x7f_ffff;
+    if exp <= 0 {
+        // Subnormal (or zero).
+        if exp < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - exp) as u32;
+        let half = m >> shift;
+        let rest = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let round = (rest > mid || (rest == mid && half & 1 == 1)) as u32;
+        return sign | (half + round) as u16;
+    }
+    let half = ((exp as u32) << 10) | (man >> 13);
+    let rest = man & 0x1fff;
+    let round = (rest > 0x1000 || (rest == 0x1000 && half & 1 == 1)) as u32;
+    // A carry into the exponent is still the right (next) value.
+    sign | (half + round).min(0x7bff) as u16
+}
+
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h as u32) & 0x8000) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let man = (h & 0x3ff) as u32;
+    let bits = match (exp, man) {
+        (0, 0) => sign,
+        (0, m) => {
+            // Subnormal: normalise.
+            let mut e = 127 - 15 + 1;
+            let mut m = m;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | ((e as u32) << 23) | ((m & 0x3ff) << 13)
+        }
+        (0x1f, 0) => sign | 0x7f80_0000,
+        (0x1f, m) => sign | 0x7f80_0000 | (m << 13),
+        (e, m) => sign | ((e + 127 - 15) << 23) | (m << 13),
+    };
+    f32::from_bits(bits)
+}
+
 fn read_f32s<const N: usize>(r: &mut impl Read) -> Result<[f32; N]> {
     let mut out = [0f32; N];
     for v in out.iter_mut() {
@@ -442,6 +489,25 @@ fn read_f32s<const N: usize>(r: &mut impl Read) -> Result<[f32; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_precision_round_trip() {
+        for v in [
+            0.0f32, 1.0, -1.0, 0.5, 0.70710677, 3.14159, 72.37, -118.6, 1e-5, 60000.0, 1e9, -1e9,
+        ] {
+            let back = f16_to_f32(f32_to_f16(v));
+            let expected = v.clamp(-65504.0, 65504.0);
+            let tolerance = expected.abs() / 1024.0 + 1e-7;
+            assert!((back - expected).abs() <= tolerance, "{v} -> {back}");
+        }
+        // Exhaustive: every finite half survives a round trip unchanged.
+        for h in 0u16..=0xffff {
+            let v = f16_to_f32(h);
+            if v.is_finite() {
+                assert_eq!(f32_to_f16(v), h, "half {h:#06x}");
+            }
+        }
+    }
 
     #[test]
     fn new_replay() {

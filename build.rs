@@ -1,9 +1,7 @@
-use anyhow::Result;
-use vergen_git2::Git2Builder;
-use vergen_lib::Emitter;
-
-pub fn main() -> Result<()> {
-    Emitter::default()
-        .add_instructions(&Git2Builder::all_git()?)?
-        .emit()
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let git2 = vergen_git2::Git2Builder::all_git()?;
+    vergen::Emitter::default()
+        .add_instructions(&git2)?
+        .emit()?;
+    Ok(())
 }
