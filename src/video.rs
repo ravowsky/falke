@@ -217,6 +217,8 @@ struct Session {
     writer: Option<Writer>,
     /// The Image pass of the frame whose NoSkater pass is still to come.
     held: Option<Vec<u8>>,
+    /// A single frame shown in the Capture window instead of saved (see `start_preview`).
+    preview: Option<PreviewPass>,
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
@@ -273,9 +275,177 @@ pub fn start(settings: Settings) -> Result<()> {
         done: 0,
         gpu: None,
         held: None,
+        preview: None,
     });
     *LAST_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
+}
+
+// Previews
+
+/// A pass to preview.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewPass {
+    Image,
+    Depth,
+    World,
+    Skater,
+}
+
+impl PreviewPass {
+    pub const ALL: [PreviewPass; 4] = [
+        PreviewPass::Image,
+        PreviewPass::Depth,
+        PreviewPass::World,
+        PreviewPass::Skater,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PreviewPass::Image => "Image",
+            PreviewPass::Depth => "Depth",
+            PreviewPass::World => "World",
+            PreviewPass::Skater => "Skater",
+        }
+    }
+}
+
+/// A previewed pass, RGBA, scaled down to at most `PREVIEW_WIDTH` wide.
+pub struct Preview {
+    pub pass: PreviewPass,
+    pub size: (u32, u32),
+    pub rgba: Vec<u8>,
+    /// Counts up with every new preview.
+    pub generation: u64,
+}
+
+const PREVIEW_WIDTH: u32 = 1280;
+
+static PREVIEW: Mutex<Option<Preview>> = Mutex::new(None);
+static PREVIEW_ERROR: Mutex<Option<String>> = Mutex::new(None);
+static PREVIEW_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Draw the frame at replay time `time` once, through the same passes as a capture, and
+/// keep `pass` to show instead of saving anything. The world is held still.
+pub fn start_preview(base: &Settings, time: f32, pass: PreviewPass) -> Result<()> {
+    let mut guard = session();
+    if guard.is_some() {
+        bail!("a capture is running");
+    }
+    let settings = Settings {
+        start: time,
+        end: time,
+        image: pass == PreviewPass::Image,
+        depth: pass == PreviewPass::Depth,
+        world: pass == PreviewPass::World,
+        skater: pass == PreviewPass::Skater,
+        ..base.clone()
+    };
+    *PREVIEW_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *guard = Some(Session {
+        writer: None,
+        total: 1,
+        settings,
+        folder: PathBuf::new(),
+        next: Some(Step {
+            frame: 0,
+            pass: Pass::Main,
+        }),
+        shown: None,
+        set_up: None,
+        done: 0,
+        gpu: None,
+        held: None,
+        preview: Some(pass),
+    });
+    Ok(())
+}
+
+/// The latest preview, if it is newer than `seen` (its generation).
+pub fn take_preview(seen: u64) -> Option<Preview> {
+    let mut guard = PREVIEW.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.as_ref().is_some_and(|p| p.generation > seen) {
+        guard.take()
+    } else {
+        None
+    }
+}
+
+/// Why the last preview failed.
+pub fn preview_error() -> Option<String> {
+    PREVIEW_ERROR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Whether a preview is being drawn.
+pub fn preview_running() -> bool {
+    session().as_ref().is_some_and(|s| s.preview.is_some())
+}
+
+/// Keep a pass's output as the preview (scaled down, alpha over a checkerboard, depth as
+/// grey).
+fn keep_preview(pass: PreviewPass, job: Job) {
+    let (size, rgba) = match job {
+        Job::Color {
+            size, bgra, alpha, ..
+        } => {
+            let mut rgba = Vec::with_capacity(bgra.len());
+            for (i, px) in bgra.chunks_exact(4).enumerate() {
+                let (x, y) = (i as u32 % size.0, i as u32 / size.0);
+                let a = if alpha { px[3] as u32 } else { 255 };
+                let check = if ((x / 16) + (y / 16)) % 2 == 0 {
+                    0x60
+                } else {
+                    0x90
+                };
+                for c in [2, 1, 0] {
+                    rgba.push(((px[c] as u32 * a + check * (255 - a)) / 255) as u8);
+                }
+                rgba.push(255);
+            }
+            (size, rgba)
+        }
+        Job::Depth { size, depth, .. } => {
+            let mut rgba = Vec::with_capacity(depth.len() * 4);
+            for v in depth {
+                let g = (v >> 8) as u8;
+                rgba.extend_from_slice(&[g, g, g, 255]);
+            }
+            (size, rgba)
+        }
+    };
+    let (size, rgba) = shrink(size, rgba);
+    let generation = PREVIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    *PREVIEW.lock().unwrap_or_else(|e| e.into_inner()) = Some(Preview {
+        pass,
+        size,
+        rgba,
+        generation,
+    });
+}
+
+/// Halve an RGBA image (box filter) until it is at most `PREVIEW_WIDTH` wide.
+fn shrink(mut size: (u32, u32), mut rgba: Vec<u8>) -> ((u32, u32), Vec<u8>) {
+    while size.0 > PREVIEW_WIDTH && size.0 >= 2 && size.1 >= 2 {
+        let (w, h) = (size.0 / 2, size.1 / 2);
+        let src_w = size.0 as usize;
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                for c in 0..4 {
+                    let at = |dx: usize, dy: usize| {
+                        rgba[((2 * y + dy) * src_w + 2 * x + dx) * 4 + c] as u32
+                    };
+                    out.push(((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) / 4) as u8);
+                }
+            }
+        }
+        size = (w, h);
+        rgba = out;
+    }
+    (size, rgba)
 }
 
 /// Stop capturing (finishing the files written so far).
@@ -287,6 +457,17 @@ pub fn stop() {
 }
 
 fn finish(mut s: Session, error: Option<String>) {
+    if s.preview.is_some() {
+        if let Some(gpu) = s.gpu.take() {
+            gpu.release();
+        }
+        game::set_skater_hidden(false);
+        if let Some(e) = error {
+            log::warn!("[capture] preview failed: {e}");
+            *PREVIEW_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+        }
+        return;
+    }
     let mut error = error;
     if let Some(w) = s.writer.take() {
         if let Err(e) = w.finish() {
@@ -315,7 +496,7 @@ fn finish(mut s: Session, error: Option<String>) {
 }
 
 pub fn status() -> Option<Status> {
-    if let Some(s) = session().as_ref() {
+    if let Some(s) = session().as_ref().filter(|s| s.preview.is_none()) {
         return Some(Status {
             running: true,
             done: s.done,
@@ -343,6 +524,8 @@ pub fn plan() -> Option<Plan> {
     }
     let step = s.set_up?;
     let world_speed = match step.pass {
+        // A preview is a moment, not a stretch of the replay.
+        _ if s.preview.is_some() => 0.0,
         // One output frame of game time a drawn frame (the game runs 60 frames a second).
         Pass::Main => s.settings.speed * 60.0 / s.settings.fps as f32,
         // Held (nearly) still: the same moment drawn again.
@@ -398,39 +581,39 @@ unsafe fn present_step(s: &mut Session, dev: &IDirect3DDevice9) -> Result<()> {
     let Some(step) = s.shown else { return Ok(()) };
     let gpu = s.gpu.as_mut().unwrap();
     let (w, h) = (gpu.width, gpu.height);
-    let writer = s.writer.as_mut().context("no writer")?;
+    let mut jobs = Vec::new();
     match step.pass {
         Pass::Main => {
             let image = unsafe { gpu.read_color(dev)? };
             if s.settings.depth {
                 let raw = unsafe { gpu.read_depth(dev)? };
                 let (near, far) = game::depth_range().unwrap_or((2.0, 100_000.0));
-                writer.send(Job::Depth {
+                jobs.push(Job::Depth {
                     frame: step.frame,
                     size: (w, h),
                     depth: depth16(&raw, near, far, s.settings.depth_far),
-                })?;
+                });
             }
             if s.settings.second_pass() {
                 if s.settings.image {
-                    writer.send(Job::Color {
+                    jobs.push(Job::Color {
                         pass: "image",
                         frame: step.frame,
                         size: (w, h),
                         bgra: image.clone(),
                         alpha: false,
-                    })?;
+                    });
                 }
                 s.held = Some(image);
             } else {
                 if s.settings.image {
-                    writer.send(Job::Color {
+                    jobs.push(Job::Color {
                         pass: "image",
                         frame: step.frame,
                         size: (w, h),
                         bgra: image,
                         alpha: false,
-                    })?;
+                    });
                 }
                 s.done = step.frame + 1;
             }
@@ -439,24 +622,31 @@ unsafe fn present_step(s: &mut Session, dev: &IDirect3DDevice9) -> Result<()> {
             let world = unsafe { gpu.read_color(dev)? };
             let image = s.held.take().context("the Image pass is missing")?;
             if s.settings.skater {
-                writer.send(Job::Color {
+                jobs.push(Job::Color {
                     pass: "skater",
                     frame: step.frame,
                     size: (w, h),
                     bgra: matte(&image, &world, s.settings.matte_threshold),
                     alpha: true,
-                })?;
+                });
             }
             if s.settings.world {
-                writer.send(Job::Color {
+                jobs.push(Job::Color {
                     pass: "world",
                     frame: step.frame,
                     size: (w, h),
                     bgra: world,
                     alpha: false,
-                })?;
+                });
             }
             s.done = step.frame + 1;
+        }
+    }
+    for job in jobs {
+        match (s.preview, s.writer.as_mut()) {
+            (Some(pass), _) => keep_preview(pass, job),
+            (None, Some(writer)) => writer.send(job)?,
+            (None, None) => bail!("no writer"),
         }
     }
     Ok(())
@@ -1222,6 +1412,22 @@ mod tests {
         assert_eq!(m[3], 0);
         assert_eq!(m[7], 255);
         assert_eq!(&m[4..7], &[200, 50, 50]);
+    }
+
+    #[test]
+    fn preview_is_halved_until_small_enough() {
+        let (w, h) = (2600u32, 4u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        // The first 2x2 block: two white pixels, two black ones.
+        for (x, y) in [(0usize, 0usize), (1, 1)] {
+            let i = (y * w as usize + x) * 4;
+            rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+        let (size, out) = shrink((w, h), rgba);
+        assert_eq!(size, (1300 / 2, 1));
+        assert_eq!(out.len(), 650 * 4);
+        // Halved twice: the 4x4 block holds 2 white pixels of 16.
+        assert_eq!(out[0], 127 / 4);
     }
 
     #[test]
