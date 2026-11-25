@@ -7,6 +7,7 @@ mod logger;
 mod math;
 mod replay;
 mod thaw;
+mod thaw_blend;
 mod thps4;
 mod thug2;
 mod ui;

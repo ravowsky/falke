@@ -463,8 +463,8 @@ impl UiSystem {
         // Replay playback
         let frame = if self.playback.mode_active {
             self.loaded_replay.as_ref().and_then(|r| {
-                let t = self.playback.time * 60.0;
-                let frame_idx = (t as usize).min(r.frames.len().saturating_sub(1));
+                let t = self.playback.time;
+                let frame_idx = r.frame_at(t);
                 if frame_idx != self.last_logged_frame {
                     let player_pos = r
                         .frames
@@ -562,7 +562,7 @@ impl UiSystem {
         let replay_end = self
             .loaded_replay
             .as_ref()
-            .map(|r| r.frame_count as f32 / 60.0)
+            .map(|r| r.duration())
             .unwrap_or(0.0);
         let path_end = self
             .timeline
@@ -793,7 +793,7 @@ impl UiSystem {
                                     // The replay is the content: it defines the
                                     // timeline's length and clears any path authored
                                     // against a previous one.
-                                    let replay_duration = r.frame_count as f32 / 60.0;
+                                    let replay_duration = r.duration();
                                     let discarded = self.timeline.path.len();
                                     self.timeline.reset_for_replay(replay_duration);
                                     if discarded > 0 {

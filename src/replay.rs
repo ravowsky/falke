@@ -1,6 +1,7 @@
 use std::{
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -11,8 +12,15 @@ use crate::{
 };
 
 /// 4: like 3, but entries flagged in their bone count byte (0x80) store their bones at half
-/// precision. Version 3 files still load.
-const FLK_REPLAY_VERSION: u8 = 4;
+/// precision.
+/// 5: like 4, plus each frame's time (f32 seconds since the recording started) after the
+/// camera. Versions 3 and 4 still load (their frames are 1/60 s apart).
+const FLK_REPLAY_VERSION: u8 = 5;
+/// The frame rate replays without recorded times are played at.
+pub const FRAME_RATE: f32 = 60.0;
+/// A frame identical to the one before is not written (the game did not move on, e.g. the
+/// same scene drawn twice), unless the last written one is this old (a paused game).
+const SAME_FRAME_KEEP_AFTER: f32 = 0.25;
 const HALF_FLAG: u8 = 0x80;
 const REPLAY_FOLDER: &str = "Replays";
 
@@ -23,10 +31,14 @@ pub struct Replay {
     file_path: PathBuf,
     writer: Option<BufWriter<std::fs::File>>,
     frame_count: u64,
+    /// When the first frame was written.
+    started: Option<Instant>,
+    /// The last frame written and its time.
+    last: Option<(f32, ReplayState)>,
 }
 
 /// One skater's pose for a single frame.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkaterState {
     pub world_pos: [f32; 3],
     pub world_matrix: [f32; 16],
@@ -52,10 +64,13 @@ impl SkaterState {
 }
 
 /// One frame of a replay.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReplayState {
     pub skaters: Vec<SkaterState>,
     pub camera: Option<CameraPose>,
+    /// When the frame is played, in seconds from the start of the replay (see
+    /// `LoadedReplay::load`). Not used when recording.
+    pub time: f32,
 }
 
 impl Replay {
@@ -64,6 +79,8 @@ impl Replay {
             file_path: PathBuf::from(REPLAY_FOLDER).join(name.to_owned() + ".flk"),
             writer: None,
             frame_count: 0,
+            started: None,
+            last: None,
         }
     }
 
@@ -83,11 +100,25 @@ impl Replay {
         Ok(())
     }
 
-    /// Writes one captured frame to disk and advances the frame counter.
-    /// No-ops if the frame holds no skaters (e.g. none loaded yet).
+    /// Writes one captured frame to disk, with the time it was captured, and advances the
+    /// frame counter. No-ops if the frame holds no skaters (e.g. none loaded yet), or if it is
+    /// the same as the frame before (see `SAME_FRAME_KEEP_AFTER`).
     pub fn write_frame(&mut self, state: &ReplayState) -> Result<()> {
         if state.skaters.is_empty() {
             return Ok(());
+        }
+        let time = self
+            .started
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .as_secs_f32();
+        if let Some((last_time, last)) = &self.last {
+            if last.skaters == state.skaters
+                && last.camera == state.camera
+                && time - last_time < SAME_FRAME_KEEP_AFTER
+            {
+                return Ok(());
+            }
         }
         let writer = self.writer.as_mut().context("replay writer not open")?;
 
@@ -126,7 +157,9 @@ impl Replay {
             }
             None => writer.write_all(&[0])?,
         }
+        write_f32s(writer, &[time])?;
         self.frame_count += 1;
+        self.last = Some((time, state.clone()));
         Ok(())
     }
 
@@ -172,7 +205,7 @@ impl LoadedReplay {
         file.read_exact(&mut version)
             .context("failed to read replay version")?;
         let version = version[0];
-        if version != 3 && version != FLK_REPLAY_VERSION {
+        if !(3..=FLK_REPLAY_VERSION).contains(&version) {
             anyhow::bail!("unsupported replay version: {version}");
         }
 
@@ -252,8 +285,24 @@ impl LoadedReplay {
             } else {
                 None
             };
+            let time = if version >= 5 {
+                read_f32s::<1>(&mut file)?[0]
+            } else {
+                frames.len() as f32 / FRAME_RATE
+            };
 
-            frames.push(ReplayState { skaters, camera });
+            frames.push(ReplayState {
+                skaters,
+                camera,
+                time,
+            });
+        }
+        if version >= 5 {
+            let recorded: Vec<f32> = frames.iter().map(|f| f.time).collect();
+            let times = playback_times(&recorded, &frames_positions(&frames));
+            for (f, t) in frames.iter_mut().zip(times) {
+                f.time = t;
+            }
         }
 
         Ok(Self {
@@ -267,6 +316,16 @@ impl LoadedReplay {
         self.frames.get(index)
     }
 
+    /// How long the replay plays, in seconds.
+    pub fn duration(&self) -> f32 {
+        self.frames.last().map(|f| f.time).unwrap_or(0.0)
+    }
+
+    /// The frame played at `t` seconds (the last one at or before it).
+    pub fn frame_at(&self, t: f32) -> usize {
+        self.locate(t).map(|(i0, _, _)| i0).unwrap_or(0)
+    }
+
     /// Like `sample`, but lets the game backend build the skaters itself from the frames
     /// around `t` (`blend(frames, i0, frac)`; `None` = generic interpolation).
     pub fn sample_with(
@@ -278,25 +337,41 @@ impl LoadedReplay {
         if i0 != i1 {
             if let Some(skaters) = blend(&self.frames, i0, frac) {
                 let camera = lerp_camera(&self.frames[i0], &self.frames[i1], frac);
-                return Some(ReplayState { skaters, camera });
+                return Some(ReplayState {
+                    skaters,
+                    camera,
+                    time: t,
+                });
             }
         }
         self.sample(t)
     }
 
-    /// The two frames around `t` (in frame units) and how far between them it is.
+    /// The two frames around `t` (seconds) and how far between them it is.
     fn locate(&self, t: f32) -> Option<(usize, usize, f32)> {
         let max = self.frames.len().checked_sub(1)?;
-        let t = t.clamp(0.0, max as f32);
-        let i0 = (t as usize).min(max);
-        Some((i0, (i0 + 1).min(max), t - i0 as f32))
+        // The first frame played after `t`.
+        let after = self.frames.partition_point(|f| f.time <= t);
+        if after == 0 {
+            return Some((0, 1.min(max), 0.0));
+        }
+        if after > max {
+            return Some((max, max, 0.0));
+        }
+        let (i0, i1) = (after - 1, after);
+        let span = self.frames[i1].time - self.frames[i0].time;
+        let frac = if span > 0.0 {
+            ((t - self.frames[i0].time) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        Some((i0, i1, frac))
     }
 
-    /// Sample the replay at a fractional frame index, interpolating between the
-    /// two surrounding frames. `t` is in frame units (seconds * 60).
+    /// Sample the replay at `t` seconds, interpolating between the two surrounding frames.
     pub fn sample(&self, t: f32) -> Option<ReplayState> {
         let (i0, i1, frac) = self.locate(t)?;
-        if i0 == i1 {
+        if i0 == i1 || frac == 0.0 {
             return Some(self.frames[i0].clone());
         }
 
@@ -320,6 +395,7 @@ impl LoadedReplay {
             return Some(ReplayState {
                 skaters: nearest.skaters.clone(),
                 camera,
+                time: t,
             });
         }
 
@@ -346,8 +422,83 @@ impl LoadedReplay {
             })
             .collect();
 
-        Some(ReplayState { skaters, camera })
+        Some(ReplayState {
+            skaters,
+            camera,
+            time: t,
+        })
     }
+}
+
+/// Where the first skater is in each frame (`None` without one).
+fn frames_positions(frames: &[ReplayState]) -> Vec<Option<[f32; 3]>> {
+    frames
+        .iter()
+        .map(|f| f.skaters.first().map(|s| s.world_pos))
+        .collect()
+}
+
+/// When each frame is played, from the times they were captured (`recorded`).
+///
+/// A frame is captured when the game draws it, but how far the game moved on in it depends on
+/// the time it measured for that frame: usually the frame before's, sometimes its own. A frame
+/// that took long (a hitch) moves the skater further, and played at an even pace that shows as
+/// a lurch. So the frames are spaced by the recorded times, whichever way round fits the
+/// skater's motion best (the steadiest speed), or evenly if neither helps.
+fn playback_times(recorded: &[f32], positions: &[Option<[f32; 3]>]) -> Vec<f32> {
+    let n = recorded.len();
+    if n < 3 {
+        return (0..n).map(|i| i as f32 / FRAME_RATE).collect();
+    }
+    // The gaps between frames as captured (never zero or backwards).
+    let gaps: Vec<f32> = recorded
+        .windows(2)
+        .map(|w| (w[1] - w[0]).max(1e-4))
+        .collect();
+    let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
+    // Gap `i` (frame i to i + 1) under each way of reading the times.
+    let even = |_: usize| mean;
+    let own = |i: usize| gaps[i];
+    let before = |i: usize| if i == 0 { gaps[0] } else { gaps[i - 1] };
+    // How unsteady the skater's speed is when frames are spaced by `gap`.
+    let roughness = |gap: &dyn Fn(usize) -> f32| -> f32 {
+        let step = |i: usize| -> Option<f32> {
+            let (a, b) = (positions.get(i)?.as_ref()?, positions.get(i + 1)?.as_ref()?);
+            let d: f32 = (0..3).map(|c| (b[c] - a[c]).powi(2)).sum::<f32>().sqrt();
+            Some(d)
+        };
+        let mut sum = 0.0;
+        for i in 1..gaps.len() {
+            let (Some(s0), Some(s1)) = (step(i - 1), step(i)) else {
+                continue;
+            };
+            // Only steady motion says anything: not standing still, not a snap (the game
+            // putting the skater onto a wall, a respawn).
+            if s0 < 2.0 || s1 < 2.0 || (s1 / s0).ln().abs() > 3f32.ln() {
+                continue;
+            }
+            sum += ((s1 / gap(i)) / (s0 / gap(i - 1))).ln().abs();
+        }
+        sum
+    };
+    let (r_even, r_own, r_before) = (roughness(&even), roughness(&own), roughness(&before));
+    // Even spacing unless a reading of the times is clearly steadier.
+    let gap: &dyn Fn(usize) -> f32 = if r_own.min(r_before) < 0.97 * r_even {
+        if r_own <= r_before { &own } else { &before }
+    } else {
+        &even
+    };
+    log::debug!(
+        "replay timing: unsteadiness {r_even:.1} evenly, {r_own:.1} by own times, {r_before:.1} by the previous frame's"
+    );
+    let mut times = Vec::with_capacity(n);
+    let mut t = 0.0;
+    times.push(t);
+    for i in 0..gaps.len() {
+        t += gap(i);
+        times.push(t);
+    }
+    times
 }
 
 /// The camera between two frames (the earlier one's if either has none).
@@ -507,6 +658,72 @@ mod tests {
                 assert_eq!(f32_to_f16(v), h, "half {h:#06x}");
             }
         }
+    }
+
+    fn frame_at(time: f32) -> ReplayState {
+        ReplayState {
+            time,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn locate_by_time() {
+        let replay = LoadedReplay {
+            name: "t".into(),
+            frame_count: 3,
+            frames: vec![frame_at(0.0), frame_at(0.02), frame_at(0.05)],
+        };
+        assert_eq!(replay.locate(-1.0), Some((0, 1, 0.0)));
+        assert_eq!(replay.locate(0.01), Some((0, 1, 0.5)));
+        assert_eq!(replay.locate(0.035), Some((1, 2, 0.5)));
+        assert_eq!(replay.locate(9.0), Some((2, 2, 0.0)));
+        assert_eq!(replay.frame_at(0.03), 1);
+        assert!((replay.duration() - 0.05).abs() < 1e-6);
+    }
+
+    /// A skater moving at a steady speed, captured with one slow frame: the times should
+    /// space the frames so that the speed stays steady.
+    #[test]
+    fn hitch_is_spaced_out() {
+        let speed = 900.0; // units a second
+        // Captured every 1/60 s except one frame that took 1/30 s. The game moves the skater by
+        // the time the frame before took.
+        let mut recorded = vec![0.0f32];
+        let mut dt_used = vec![];
+        for i in 1..40 {
+            let dt = if i == 20 { 1.0 / 30.0 } else { 1.0 / 60.0 };
+            recorded.push(recorded[i - 1] + dt);
+            dt_used.push(dt);
+        }
+        let mut positions = vec![Some([0.0f32, 0.0, 0.0])];
+        for i in 1..40 {
+            // The step from frame i - 1 to i used the time frame i - 1 took.
+            let dt = if i >= 2 { dt_used[i - 2] } else { 1.0 / 60.0 };
+            let x = positions[i - 1].unwrap()[0] + speed * dt;
+            positions.push(Some([x, 0.0, 0.0]));
+        }
+        let times = playback_times(&recorded, &positions);
+        for i in 1..39 {
+            let dx = positions[i + 1].unwrap()[0] - positions[i].unwrap()[0];
+            let v = dx / (times[i + 1] - times[i]);
+            assert!((v - speed).abs() < 1.0, "frame {i}: speed {v}");
+        }
+    }
+
+    #[test]
+    fn steady_frames_stay_even() {
+        let recorded: Vec<f32> = (0..30)
+            .map(|i| i as f32 / 60.0 + if i % 2 == 0 { 0.001 } else { 0.0 })
+            .collect();
+        let positions: Vec<Option<[f32; 3]>> =
+            (0..30).map(|i| Some([i as f32 * 10.0, 0.0, 0.0])).collect();
+        let times = playback_times(&recorded, &positions);
+        let gaps: Vec<f32> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        let (lo, hi) = gaps
+            .iter()
+            .fold((f32::MAX, 0f32), |(a, b), g| (a.min(*g), b.max(*g)));
+        assert!(hi - lo < 1e-5, "{gaps:?}");
     }
 
     #[test]
