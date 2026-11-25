@@ -119,6 +119,10 @@ for every frame the game draws, however long saving takes. So 500 fps is as smoo
     differ: the skater, and what it changes (its shadow, reflections). ProRes 4444 or PNG
     keep the alpha; with H.264 this pass is written as PNGs.
 
+**👁 Preview** draws the pass picked next to it once, at the playhead, and shows it in the
+Capture window (tick **Large** for a window of its own). Nothing is saved, so it is a quick
+way to check the Depth range or the Skater threshold before a long capture.
+
 Captures read the game's own frame (Direct3D 9). Effects added further down the chain are
 not in them: with dgVoodoo set to DirectX 11, ReShade, DLSS or RenoDX running on the
 DirectX 11 side are not captured.

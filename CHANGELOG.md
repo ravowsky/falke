@@ -32,6 +32,7 @@ Unreleased
   - ProRes 4444 / ProRes 422 HQ / H.264 through ffmpeg (`ffmpeg.exe` next to the game), or PNG / TGA sequences without ffmpeg
   - Passes (THAW): Image, Depth (16-bit PNG, linear distance, read from the depth buffer swapped for a readable INTZ one while capturing), World (redrawn without the skater, world held still), Skater (the image with alpha where it differs from World)
   - Output in `Captures\<name>\` next to the game
+  - Preview: any pass drawn once at the playhead and shown in the Capture window (or a large window of its own), nothing saved
 - Bone camera mode (THAW): the camera rides one of the replayed skater's bones (board cam, head cam), with offset, turn, horizon levelling and stabilizing; bones can be picked by clicking their numbers on screen
 - Faster replay loading
 - Game backends can provide their own skater blending and world time scale
