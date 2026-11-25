@@ -47,6 +47,23 @@ pub trait Game: Sync {
     /// so it follows the replay's playback speed. 1.0 is normal. Optional per game.
     fn set_time_scale(&self, _scale: f32) {}
 
+    /// Where each of the skater's bones is in a replay frame: position and rotation (rows,
+    /// the bone's own axes in world space). Empty when the game cannot tell (the bone
+    /// camera needs it).
+    fn skater_bones(&self, _frame: &ReplayState) -> Vec<Bone> {
+        Vec::new()
+    }
+
+    /// Hide the replayed skater (moved out of sight) instead of drawing it, for capture
+    /// passes of the world without the skater. Optional per game.
+    fn set_skater_hidden(&self, _hidden: bool) {}
+
+    /// The near and far clip distances the scene is drawn with, to turn depth buffer
+    /// values into distances. Optional per game.
+    fn depth_range(&self) -> Option<(f32, f32)> {
+        None
+    }
+
     /// Build the skaters between recorded frames `i0` and `i0 + 1` (`frac` 0..1) when the
     /// game stores them in a way the generic interpolation cannot blend. `None` = generic.
     fn blend_skaters(
@@ -57,6 +74,14 @@ pub trait Game: Sync {
     ) -> Option<Vec<SkaterState>> {
         None
     }
+}
+
+/// One bone of a skater, in world space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bone {
+    pub pos: [f32; 3],
+    /// The bone's axes in world space (rows).
+    pub rows: [[f32; 3]; 3],
 }
 
 static GAME: OnceLock<&'static dyn Game> = OnceLock::new();
@@ -145,4 +170,21 @@ pub fn sync_moving_objects() -> bool {
 
 pub fn set_sync_moving_objects(on: bool) {
     SYNC_MOVING_OBJECTS.store(on, Ordering::Relaxed);
+}
+
+/// The skater's bones in a replay frame (see `Game::skater_bones`).
+pub fn skater_bones(frame: &ReplayState) -> Vec<Bone> {
+    current().map(|g| g.skater_bones(frame)).unwrap_or_default()
+}
+
+/// Hide or show the replayed skater (see `Game::set_skater_hidden`).
+pub fn set_skater_hidden(hidden: bool) {
+    if let Some(g) = current() {
+        g.set_skater_hidden(hidden);
+    }
+}
+
+/// The scene's near and far clip distances (see `Game::depth_range`).
+pub fn depth_range() -> Option<(f32, f32)> {
+    current().and_then(|g| g.depth_range())
 }

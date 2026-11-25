@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use egui_d3d9::EguiDx9;
 use retour::static_detour;
 use std::{
+    ffi::c_void,
     mem::transmute,
     sync::{Mutex, OnceLock},
 };
@@ -27,12 +28,14 @@ use windows::{
 use crate::{
     capture, game,
     ui::{UI_SYSTEM, ui_render_loop},
+    video,
 };
 
 static_detour! {
     static PresentHook: unsafe extern "stdcall" fn(IDirect3DDevice9, *const RECT, *const RECT, HWND, *const RGNDATA) -> HRESULT;
     static ResetHook: unsafe extern "stdcall" fn(IDirect3DDevice9, *const D3DPRESENT_PARAMETERS) -> HRESULT;
     static EndSceneHook: unsafe extern "stdcall" fn(*mut IDirect3DDevice9) -> HRESULT;
+    static SetDepthStencilHook: unsafe extern "stdcall" fn(*mut c_void, *mut c_void) -> HRESULT;
 }
 
 struct AppCell(Mutex<EguiDx9<i32>>);
@@ -60,6 +63,12 @@ pub unsafe fn install_hooks() -> Result<()> {
     install_d3d9!(PresentHook, Present, hk_present, "Present");
     install_d3d9!(EndSceneHook, EndScene, hk_endscene, "EndScene");
     install_d3d9!(ResetHook, Reset, hk_reset, "Reset");
+    install_d3d9!(
+        SetDepthStencilHook,
+        SetDepthStencilSurface,
+        hk_set_depth_stencil,
+        "SetDepthStencilSurface"
+    );
 
     Ok(())
 }
@@ -87,6 +96,9 @@ fn hk_present(
             AppCell(Mutex::new(app))
         });
 
+        // Read the frame for a running capture before the overlay is drawn on it.
+        video::on_present(&dev);
+
         cell.0.lock().unwrap().present(&dev);
 
         PresentHook.call(dev, source_rect, dest_rect, window, rgn_data)
@@ -98,6 +110,7 @@ fn hk_reset(
     presentation_parameters: *const D3DPRESENT_PARAMETERS,
 ) -> HRESULT {
     unsafe {
+        video::on_reset();
         if let Some(cell) = APP.get() {
             cell.0.lock().unwrap().pre_reset();
         }
@@ -160,4 +173,17 @@ pub fn hk_endscene(device: *mut IDirect3DDevice9) -> HRESULT {
     unsafe { capture::on_endscene(playback.as_ref()) };
 
     unsafe { EndSceneHook.call(device) }
+}
+
+/// While a capture reads depth, the game's depth buffer is swapped for a readable one.
+fn hk_set_depth_stencil(dev: *mut c_void, surface: *mut c_void) -> HRESULT {
+    let surface = video::depth_substitute(surface).unwrap_or(surface);
+    unsafe { SetDepthStencilHook.call(dev, surface) }
+}
+
+/// End a scene without going through falke's `EndScene` hook (for falke's own drawing).
+pub fn end_scene_unhooked(dev: &IDirect3DDevice9) {
+    unsafe {
+        let _ = EndSceneHook.call(dev.as_raw() as *mut IDirect3DDevice9);
+    }
 }

@@ -11,12 +11,14 @@ use std::{
 };
 
 use crate::{
+    bone_camera::{self, BoneCamera},
     camera::{CameraPath, CameraPose, Keyframe, OrbitCamera, fov_approx_eq},
     capture,
     falke::version_string,
     game,
     math::Vec3,
     replay::{LoadedReplay, ReplayState},
+    video,
 };
 
 pub static UI_SYSTEM: OnceLock<Mutex<UiSystem>> = OnceLock::new();
@@ -346,17 +348,31 @@ pub enum CameraMode {
     /// run of them sweeps round the pivot at a constant radius. Paused, the
     /// mouse owns the camera, playing, the path does.
     Orbit,
+    /// Fixed to one of the replayed skater's bones (board cam, head cam). The authored
+    /// path is ignored.
+    Bone,
 }
 
 impl CameraMode {
-    const ALL: [CameraMode; 3] = [CameraMode::Freecam, CameraMode::Pov, CameraMode::Orbit];
+    const ALL: [CameraMode; 4] = [
+        CameraMode::Freecam,
+        CameraMode::Pov,
+        CameraMode::Orbit,
+        CameraMode::Bone,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             CameraMode::Freecam => "Freecam",
             CameraMode::Pov => "POV",
             CameraMode::Orbit => "Orbit",
+            CameraMode::Bone => "Bone",
         }
+    }
+
+    /// Modes that fly no authored path (and need a replay).
+    fn ignores_path(self) -> bool {
+        matches!(self, CameraMode::Pov | CameraMode::Bone)
     }
 }
 
@@ -387,6 +403,14 @@ pub struct UiSystem {
     pub camera_mode: CameraMode,
     pub orbit: OrbitCamera,
     last_logged_frame: usize,
+    pub bone_camera: BoneCamera,
+    /// The replayed skater's bones as last shown, for picking one on screen.
+    shown_bones: Vec<game::Bone>,
+    pub capture: video::Settings,
+    /// Why the last capture could not start.
+    capture_error: Option<String>,
+    /// Whether ffmpeg was found (checked when the Capture window first opens).
+    ffmpeg: Option<bool>,
 }
 
 impl Default for UiSystem {
@@ -411,6 +435,11 @@ impl Default for UiSystem {
                 aim_height: OrbitCamera::DEFAULT_AIM_HEIGHT,
             },
             last_logged_frame: usize::MAX,
+            bone_camera: BoneCamera::default(),
+            shown_bones: Vec::new(),
+            capture: video::Settings::default(),
+            capture_error: None,
+            ffmpeg: None,
         }
     }
 }
@@ -435,8 +464,8 @@ impl UiSystem {
         }
 
         // POV plays back the camera a replay was shot with, so it cannot
-        // outlive the replay: unloading one drops the mode with it.
-        if self.camera_mode == CameraMode::Pov && self.loaded_replay.is_none() {
+        // outlive the replay: unloading one drops the mode with it. So does Bone.
+        if self.camera_mode.ignores_path() && self.loaded_replay.is_none() {
             self.camera_mode = CameraMode::Freecam;
         }
 
@@ -445,7 +474,18 @@ impl UiSystem {
             self.playback.mode_active = true;
         }
 
-        self.playback.advance();
+        // A running capture moves playback on by exactly one output frame a drawn frame.
+        let capture_plan = video::plan();
+        match capture_plan {
+            Some(plan) => {
+                self.playback.mode_active = true;
+                self.playback.playing = false;
+                self.playback.last_update = None;
+                self.playback.time = plan.time;
+                game::set_skater_hidden(plan.hide_skater);
+            }
+            None => self.playback.advance(),
+        }
 
         if (self.playback.time - self.last_seen_time).abs() > f32::EPSILON {
             self.rig_owns_camera = false;
@@ -496,7 +536,9 @@ impl UiSystem {
         // The game world (traffic, pedestrians, rain, cranes) runs at the playback speed
         // while a replay plays, stands (nearly) still while it is paused in the freecam, and
         // runs at normal speed otherwise.
-        let world_speed = if self.playback.mode_active && self.playback.playing {
+        let world_speed = if let Some(plan) = capture_plan {
+            plan.world_speed
+        } else if self.playback.mode_active && self.playback.playing {
             self.playback.speed
         } else if self.playback.mode_active && self.loaded_replay.is_some() && game::in_freecam() {
             0.0
@@ -511,6 +553,7 @@ impl UiSystem {
             let pose: Option<CameraPose> = match self.camera_mode {
                 // `frame` is only Some in playback mode, which gates this.
                 CameraMode::Pov => frame.as_ref().and_then(|f| f.camera),
+                CameraMode::Bone => self.bone_pose(frame.as_ref()),
                 CameraMode::Freecam => {
                     if self.playback.mode_active {
                         self.timeline.path.sample(self.playback.time, skater)
@@ -546,6 +589,8 @@ impl UiSystem {
             }
         }
 
+        self.shown_bones = frame.as_ref().map(game::skater_bones).unwrap_or_default();
+
         // Stop playing when we reach the end of all content.
         if self.playback.playing && end_time > 0.0 && self.playback.time >= end_time {
             self.playback.playing = false;
@@ -555,6 +600,22 @@ impl UiSystem {
         }
 
         frame
+    }
+
+    /// The bone camera's pose for the replay frame shown now.
+    fn bone_pose(&self, frame: Option<&ReplayState>) -> Option<CameraPose> {
+        let replay = self.loaded_replay.as_ref()?;
+        let now = self.playback.time;
+        self.bone_camera.pose(now, |t| {
+            if (t - now).abs() < 1e-6 {
+                frame.map(game::skater_bones).unwrap_or_default()
+            } else {
+                replay
+                    .sample_with(t, game::blend_skaters)
+                    .map(|f| game::skater_bones(&f))
+                    .unwrap_or_default()
+            }
+        })
     }
 
     /// The time at which all playback content ends — max of replay duration and last keyframe.
@@ -577,7 +638,10 @@ impl UiSystem {
     /// Is playback mode forced on rather than being the user's to pick?
     fn playback_mode_is_implied(&self) -> bool {
         self.loaded_replay.is_some()
-            && matches!(self.camera_mode, CameraMode::Pov | CameraMode::Orbit)
+            && matches!(
+                self.camera_mode,
+                CameraMode::Pov | CameraMode::Orbit | CameraMode::Bone
+            )
     }
 
     /// The fov the orbit rig flies at.
@@ -601,7 +665,7 @@ impl UiSystem {
     }
 
     fn apply_would_change_selected(&self) -> bool {
-        if self.camera_mode == CameraMode::Pov {
+        if self.camera_mode.ignores_path() {
             return false;
         }
         let Some(kf) = self
@@ -844,6 +908,299 @@ impl UiSystem {
             });
     }
 
+    pub fn update_bone_camera(&mut self, ctx: &eguiContext) {
+        let count = self.shown_bones.len();
+        let cam = &mut self.bone_camera;
+        egui::Window::new("Bone camera")
+            .default_pos(egui::pos2(40.0, 480.0))
+            .default_width(230.0)
+            .collapsible(true)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if count == 0 {
+                    ui.label("No skater bones in this frame.");
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Bone");
+                    if ui.small_button("◀").clicked() {
+                        cam.bone = cam.bone.saturating_sub(1);
+                    }
+                    ui.add(DragValue::new(&mut cam.bone).range(0..=count.saturating_sub(1).max(0)));
+                    if ui.small_button("▶").clicked() && cam.bone + 1 < count {
+                        cam.bone += 1;
+                    }
+                    ui.checkbox(&mut cam.show_bones, "Show")
+                        .on_hover_text("Show the bones' numbers; click one to pick it");
+                });
+                ui.label("Offset (along the bone's axes)");
+                ui.horizontal(|ui| {
+                    for (v, axis) in cam.offset.iter_mut().zip(["x", "y", "z"]) {
+                        ui.add(DragValue::new(v).speed(0.5).prefix(format!("{axis} ")));
+                    }
+                });
+                ui.label("Turn");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        DragValue::new(&mut cam.yaw)
+                            .speed(0.5)
+                            .suffix("°")
+                            .prefix("yaw "),
+                    );
+                    ui.add(
+                        DragValue::new(&mut cam.pitch)
+                            .speed(0.5)
+                            .suffix("°")
+                            .prefix("pitch "),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        !cam.level_horizon,
+                        DragValue::new(&mut cam.roll)
+                            .speed(0.5)
+                            .suffix("°")
+                            .prefix("roll "),
+                    );
+                    ui.add(
+                        DragValue::new(&mut cam.fov)
+                            .speed(0.2)
+                            .range(5.0..=150.0)
+                            .prefix("fov "),
+                    );
+                });
+                ui.checkbox(&mut cam.follow_rotation, "Turn with the bone");
+                ui.checkbox(&mut cam.level_horizon, "Keep the horizon level");
+                ui.horizontal(|ui| {
+                    ui.label("Stabilize");
+                    ui.add(
+                        DragValue::new(&mut cam.stabilize)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .suffix("s"),
+                    )
+                    .on_hover_text("Smooth the bone's motion over this much of the replay");
+                });
+                if ui.button("Reset").clicked() {
+                    *cam = BoneCamera {
+                        bone: cam.bone,
+                        ..BoneCamera::default()
+                    };
+                }
+            });
+
+        // The bones' numbers over the game, to pick one by clicking it.
+        if !self.bone_camera.show_bones {
+            return;
+        }
+        let Some(pose) = game::camera() else { return };
+        let screen = ctx.screen_rect();
+        let painter = ctx.layer_painter(LayerId::new(Order::Background, Id::new("bone_numbers")));
+        let click = ctx.input(|i| {
+            i.pointer
+                .primary_clicked()
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+        let over_ui = ctx.is_pointer_over_area();
+        let mut picked = None;
+        for (k, b) in self.shown_bones.iter().enumerate() {
+            let Some((x, y)) =
+                bone_camera::project(&pose, (screen.width(), screen.height()), b.pos)
+            else {
+                continue;
+            };
+            let at = Pos2::new(screen.left() + x, screen.top() + y);
+            let selected = k == self.bone_camera.bone;
+            let color = if selected {
+                Color32::YELLOW
+            } else {
+                Color32::from_white_alpha(200)
+            };
+            painter.circle_filled(at, if selected { 4.0 } else { 2.5 }, color);
+            painter.text(
+                at + Vec2::new(4.0, -4.0),
+                Align2::LEFT_BOTTOM,
+                k.to_string(),
+                FontId::proportional(11.0),
+                color,
+            );
+            if let Some(p) = click {
+                if !over_ui && p.distance(at) < 8.0 {
+                    picked = Some(k);
+                }
+            }
+        }
+        if let Some(k) = picked {
+            self.bone_camera.bone = k;
+        }
+    }
+
+    pub fn update_capture(&mut self, ctx: &eguiContext) {
+        let end_time = self.playback_end_time();
+        let has_content = end_time > 0.0;
+        let status = video::status();
+        let running = status.as_ref().is_some_and(|s| s.running);
+        if self.ffmpeg.is_none() {
+            self.ffmpeg = Some(video::find_ffmpeg().is_some());
+        }
+        egui::Window::new("Capture")
+            .default_pos(egui::pos2(40.0, 120.0))
+            .default_width(260.0)
+            .default_open(false)
+            .collapsible(true)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let c = &mut self.capture;
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(150.0));
+                    });
+                    egui::ComboBox::from_label("Format")
+                        .selected_text(c.format.label())
+                        .show_ui(ui, |ui| {
+                            for f in video::Format::ALL {
+                                ui.selectable_value(&mut c.format, f, f.label());
+                            }
+                        });
+                    if c.format.needs_ffmpeg() && self.ffmpeg == Some(false) {
+                        ui.colored_label(
+                            STALE_KEY_COLOR,
+                            "ffmpeg.exe not found: put it next to the game's exe",
+                        );
+                        if ui.small_button("Look again").clicked() {
+                            self.ffmpeg = None;
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Frame rate");
+                        ui.add(DragValue::new(&mut c.fps).range(1..=2000).suffix(" fps"));
+                        for fps in [60, 120, 240, 500] {
+                            if ui.small_button(fps.to_string()).clicked() {
+                                c.fps = fps;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Speed");
+                        ui.add(
+                            DragValue::new(&mut c.speed)
+                                .speed(0.01)
+                                .range(0.01..=4.0)
+                                .suffix("x"),
+                        )
+                        .on_hover_text(
+                            "Replay seconds per second of video (0.1 = ten times slower)",
+                        );
+                        if ui.small_button("= playback").clicked() {
+                            c.speed = self.playback.speed;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("From");
+                        ui.add(
+                            DragValue::new(&mut c.start)
+                                .speed(0.01)
+                                .range(0.0..=end_time)
+                                .suffix("s"),
+                        );
+                        ui.label("to");
+                        ui.add(
+                            DragValue::new(&mut c.end)
+                                .speed(0.01)
+                                .range(0.0..=end_time)
+                                .suffix("s"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Start = playhead").clicked() {
+                            c.start = self.playback.time;
+                        }
+                        if ui.small_button("End = playhead").clicked() {
+                            c.end = self.playback.time;
+                        }
+                        if ui.small_button("All").clicked() {
+                            c.start = 0.0;
+                            c.end = end_time;
+                        }
+                    });
+                    ui.label("Passes");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut c.image, "Image");
+                        ui.checkbox(&mut c.depth, "Depth")
+                            .on_hover_text("16-bit PNGs, black near, white at the distance below");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut c.world, "World")
+                            .on_hover_text("Drawn again without the skater");
+                        ui.checkbox(&mut c.skater, "Skater").on_hover_text(
+                            "The image with alpha: only where it differs from World",
+                        );
+                    });
+                    if c.depth {
+                        ui.horizontal(|ui| {
+                            ui.label("Depth white at");
+                            ui.add(
+                                DragValue::new(&mut c.depth_far)
+                                    .speed(10.0)
+                                    .range(10.0..=100_000.0),
+                            );
+                        });
+                    }
+                    if c.skater {
+                        ui.horizontal(|ui| {
+                            ui.label("Skater threshold");
+                            ui.add(DragValue::new(&mut c.matte_threshold).range(0..=128));
+                        });
+                    }
+                    if c.end > c.start && c.fps > 0 {
+                        let frames = c.frame_count();
+                        ui.label(format!(
+                            "{frames} frames, {:.1}s of video",
+                            frames as f32 / c.fps as f32
+                        ));
+                    }
+                });
+
+                if running {
+                    let s = status.as_ref().unwrap();
+                    ui.add(
+                        egui::ProgressBar::new(s.done as f32 / s.total.max(1) as f32)
+                            .text(format!("{} / {}", s.done, s.total)),
+                    );
+                    if ui.button("⏹ Stop").clicked() {
+                        video::stop();
+                    }
+                } else {
+                    let can_start = has_content && game::in_freecam();
+                    if ui
+                        .add_enabled(can_start, egui::Button::new("🎬 Capture"))
+                        .on_disabled_hover_text("Load a replay or make a path, in the freecam")
+                        .clicked()
+                    {
+                        if c.end <= c.start {
+                            c.start = 0.0;
+                            c.end = end_time;
+                        }
+                        self.capture_error =
+                            video::start(c.clone()).err().map(|e| format!("{e:#}"));
+                    }
+                    if let Some(e) = &self.capture_error {
+                        ui.colored_label(STALE_KEY_COLOR, e);
+                    } else if let Some(s) = &status {
+                        match &s.error {
+                            Some(e) => ui.colored_label(STALE_KEY_COLOR, format!("Stopped: {e}")),
+                            None => ui.label(format!(
+                                "Saved {} frames to {}",
+                                s.done,
+                                s.folder.display()
+                            )),
+                        };
+                    }
+                }
+            });
+    }
+
     pub fn update_keyframe_detail(&mut self, ctx: &eguiContext) {
         let top_padding = 480.0;
         let right_padding = 40.0;
@@ -1078,8 +1435,9 @@ impl UiSystem {
 
                 // POV flies the camera the replay was shot with and ignores the
                 // authored path.
-                let authoring = self.camera_mode != CameraMode::Pov;
-                const POV_HINT: &str = "POV plays the replay's own camera — keyframes are ignored";
+                let authoring = !self.camera_mode.ignores_path();
+                const POV_HINT: &str =
+                    "POV and Bone fly their own camera — keyframes are ignored";
 
                 ui.add_enabled_ui(authoring, |ui| {
                     if ui
@@ -1194,7 +1552,7 @@ impl UiSystem {
                     .width(80.0)
                     .show_ui(ui, |ui| {
                         for mode in CameraMode::ALL {
-                            if mode == CameraMode::Pov {
+                            if mode.ignores_path() {
                                 if !pov_offered {
                                     continue;
                                 }
@@ -1518,6 +1876,12 @@ pub fn ui_render_loop(ctx: &eguiContext, _i: &mut i32) {
     if authoring {
         ui.update_keyframe_detail(ctx);
         ui.update_orbit_input(ctx);
+        if ui.camera_mode == CameraMode::Bone {
+            ui.update_bone_camera(ctx);
+        }
+        if replay_available {
+            ui.update_capture(ctx);
+        }
     }
 
     // We don't want to autofocus any text inputs.

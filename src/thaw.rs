@@ -195,6 +195,14 @@ impl Game for Thaw {
             .unwrap_or(&frame.skaters[0]);
         let mut matrix = first.world_matrix;
         orthonormalize(&mut matrix);
+        // Hidden (a capture pass without the skater): drawn far below the level.
+        let drop = if SKATER_HIDDEN.load(Ordering::Relaxed) {
+            HIDE_DEPTH
+        } else {
+            0.0
+        };
+        let mut world_pos = first.world_pos;
+        world_pos[1] -= drop;
 
         // Entries after the three pose entries without bones are the parts' own world
         // matrices.
@@ -206,13 +214,15 @@ impl Game for Thaw {
             .map(|s| {
                 let mut m = s.world_matrix;
                 orthonormalize(&mut m);
-                world_matrix_of(&s.world_pos, &m)
+                let mut pos = s.world_pos;
+                pos[1] -= drop;
+                world_matrix_of(&pos, &m)
             })
             .collect();
         // The game does not commit the skater in the freecam; if it ever does, its own
         // commit is left alone.
         if P_COMMITS.swap(0, Ordering::Relaxed) == 0 {
-            commit_skater(pose_addr, &first.world_pos, &matrix, &part_worlds);
+            commit_skater(pose_addr, &world_pos, &matrix, &part_worlds);
         }
         play_cars(frame);
         if crate::game::sync_moving_objects() {
@@ -266,6 +276,37 @@ impl Game for Thaw {
         blend_in_world_space(frames, i0, frac)
     }
 
+    fn skater_bones(&self, frame: &ReplayState) -> Vec<crate::game::Bone> {
+        if frame.skaters.len() < 3 || frame.skaters[0].bones() == 0 {
+            return Vec::new();
+        }
+        let rot = rotation_rows(&frame.skaters[0].world_matrix);
+        let origin = frame.skaters[0].world_pos;
+        rebuild_pose(frame)
+            .iter()
+            .take(frame.skaters[0].bones())
+            .map(|m| {
+                let (e, _) = split_rows(m);
+                let p = vec_mul([m[12], m[13], m[14]], &rot);
+                crate::game::Bone {
+                    pos: std::array::from_fn(|i| p[i] + origin[i]),
+                    rows: mul_rows(&e, &rot),
+                }
+            })
+            .collect()
+    }
+
+    fn set_skater_hidden(&self, hidden: bool) {
+        SKATER_HIDDEN.store(hidden, Ordering::Relaxed);
+    }
+
+    /// `Nx::set_camera` (0x536c40) builds the projection with a near distance of 2 and the
+    /// far distance it keeps at 0x858fa4.
+    fn depth_range(&self) -> Option<(f32, f32)> {
+        let far = read::<f32>(ADDR_FAR_CLIP).filter(|f| f.is_finite() && *f > SCENE_NEAR_CLIP)?;
+        Some((SCENE_NEAR_CLIP, far))
+    }
+
     /// Called every frame by the UI; only calls the game when the speed changes, so the
     /// game's own slow motion (e.g. focus) is left alone the rest of the time.
     fn set_time_scale(&self, scale: f32) {
@@ -294,6 +335,12 @@ impl Game for Thaw {
         log::debug!("[THAW] game speed {current} -> {scale}");
     }
 }
+
+/// While set, the replayed skater is drawn out of sight (see `Game::set_skater_hidden`).
+static SKATER_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// The far clip distance of the scene camera (`Nx::set_camera`), and its fixed near one.
+const ADDR_FAR_CLIP: usize = 0x00858fa4;
+const SCENE_NEAR_CLIP: f32 = 2.0;
 
 /// The time scale falke last asked for (starts at 1.0, the game's normal speed).
 static TIME_SCALE_SET: AtomicU32 = AtomicU32::new(0x3f80_0000);

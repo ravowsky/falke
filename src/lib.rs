@@ -1,3 +1,4 @@
+mod bone_camera;
 mod camera;
 mod capture;
 mod dx_hooks;
@@ -11,6 +12,7 @@ mod thaw_blend;
 mod thps4;
 mod thug2;
 mod ui;
+mod video;
 use std::ffi::c_void;
 
 use windows::Win32::{
