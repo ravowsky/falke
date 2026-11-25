@@ -13,6 +13,10 @@ Unreleased
   - Bones are blended in world space, so turns the game undoes in one frame (switch/fakie landings) no longer swing the body around
   - Animation cuts and wallride/landing transitions are eased out instead of snapping
   - Joints stay connected while blending, no more stretched arms or exploding hands
+  - Wallrides: the snap onto and off the wall is eased out in the skater's own space, so the fade turns with the skater (it turns about 17° a frame on the wall) instead of twisting against it
+  - Turning skaters (wallrides, spins) are blended relative to the skater, so the body swings round with the turn instead of cutting across it
+  - The skater keeps its speed into a cut and curves into the new motion, instead of stalling at the cut
+  - Motion and turns follow a smooth curve through the recorded frames instead of changing direction at every frame (visible as a judder in slow motion)
 - Cars, pedestrians and other animated objects are synced to replay playback (THAW)
   - The 24 pedestrians and 24 other animated objects nearest to the skater are recorded
   - Cars that were not recorded are hidden during playback
@@ -21,6 +25,8 @@ Unreleased
 - The game world stands still while a replay is paused in freecam (THAW)
 - Generic replay interpolation no longer blends across 180° flips and animation cuts (shows the nearer frame instead)
 - Replay format version 4: cars and pedestrians are stored at half precision, about 45% smaller files; version 3 replays still load
+- Replay format version 5: every frame stores when it was captured, so frames the game took longer for (hitches) play back at their real pace instead of as a lurch; frames identical to the one before are not stored. Versions 3 and 4 still load
+- Release zip has a `rethawed` folder (falke.asi and the ASI loader)
 - Faster replay loading
 - Game backends can provide their own skater blending and world time scale
 

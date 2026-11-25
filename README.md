@@ -4,6 +4,7 @@ A tool for movie making enhancements for Neversofts Tony Hawk's Pro Skater serie
 Supported games:
 - THUGPro (THUG2 mod)
 - Better4 (THPS4 mod)
+- THAW / reTHAWed (Tony Hawk's American Wasteland)
 
 
 ## Features
@@ -26,7 +27,12 @@ THPS4 is a Direct3D 8 game and falke's overlay is Direct3D 9, so it needs my d3d
 fork (https://github.com/sourcethps/d3d8to9) to run at all.
 
 ### Simple way (bundled)
-Download the release zip and put its contents inside your game folder.
+Download the release zip and put the contents of your game's folder (`thugpro`,
+`better4` or `rethawed`) inside your game folder.
+
+For reTHAWed that is the folder with `reTHAWed.exe` (`thaw\Game`). If you already use an
+ASI loader there (a `dinput8.dll` from Ultimate ASI Loader, e.g. for ReShade or other
+plugins), keep yours and only copy `plugins\falke.asi`.
 
 ### From source (code, not me)
 You need a Rust toolchain with the 32-bit Windows target and the MSVC build tools:

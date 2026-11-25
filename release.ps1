@@ -34,7 +34,7 @@ if (Test-Path $buildDir) {
 Copy-Item -Path (Join-Path $root "CHANGELOG.md") -Destination $buildDir -Force
 Copy-Item -Path (Join-Path $root "README.md")    -Destination $buildDir -Force
 
-foreach ($game in @("thugpro", "better4")) {
+foreach ($game in @("thugpro", "better4", "rethawed")) {
     $gameDir = Join-Path $buildDir $game
     New-Item -ItemType Directory -Path (Join-Path $gameDir "plugins") -Force | Out-Null
 
@@ -42,7 +42,7 @@ foreach ($game in @("thugpro", "better4")) {
     Copy-Item -Path (Join-Path $assets "dinput8.dll") -Destination (Join-Path $gameDir "dinput8.dll") -Force
 }
 
-# Better4 needs the d3d8 wrapper, THUG Pro does not.
+# Better4 needs the d3d8 wrapper, THUG Pro and reTHAWed do not.
 Copy-Item -Path (Join-Path $assets "d3d8.dll") -Destination (Join-Path $buildDir "better4\d3d8.dll") -Force
 
 Write-Host "Packaged $Configuration build into $buildDir"
