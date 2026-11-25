@@ -27,6 +27,7 @@ Unreleased
 - Replay format version 4: cars and pedestrians are stored at half precision, about 45% smaller files; version 3 replays still load
 - Replay format version 5: every frame stores when it was captured, so frames the game took longer for (hitches) play back at their real pace instead of as a lurch; frames identical to the one before are not stored. Versions 3 and 4 still load
 - Release zip has a `rethawed` folder (falke.asi and the ASI loader)
+- Overlay no longer crashes the game with "unable to draw indexed prims" (D3DERR_INVALIDCALL) when the game ends its frame with a depth buffer of another size, extra render targets or instancing bound, or when the window is larger than the back buffer (some resolutions / DPI scaling). A draw that still fails skips that frame's UI instead of crashing. egui-d3d9 is now vendored in `egui-d3d9/` (changes in `egui-d3d9/FALKE-PATCHES.md`)
 - Faster replay loading
 - Game backends can provide their own skater blending and world time scale
 
