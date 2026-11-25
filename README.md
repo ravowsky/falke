@@ -119,13 +119,30 @@ for every frame the game draws, however long saving takes. So 500 fps is as smoo
     differ: the skater, and what it changes (its shadow, reflections). ProRes 4444 or PNG
     keep the alpha; with H.264 this pass is written as PNGs.
 
-**👁 Preview** draws the pass picked next to it once, at the playhead, and shows it in the
-Capture window (tick **Large** for a window of its own). Nothing is saved, so it is a quick
-way to check the Depth range or the Skater threshold before a long capture.
+**View in game** shows a pass live in the game instead of the normal image, so you can
+check it while you frame the shot: **Depth** as grey (set its range with "Depth white at"),
+**World** without the skater, **Skater** as the skater over a checkerboard (it compares
+every other frame, so pause playback to check the threshold). World and Skater need a
+replay playing or paused in the freecam. Starting a capture switches the view back to Image.
 
-Captures read the game's own frame (Direct3D 9). Effects added further down the chain are
-not in them: with dgVoodoo set to DirectX 11, ReShade, DLSS or RenoDX running on the
-DirectX 11 side are not captured.
+**Image from** picks where the Image, World and Skater passes are read:
+- **Game**: the game's own frame (Direct3D 9), before anything further down the chain.
+- **Screen**: what reaches the screen, after ReShade and its add-ons (DLSS, RenoDX, ...).
+  Needs ReShade with add-on support running on dgVoodoo's DirectX 11 output (ReShade as
+  `dxgi.dll` next to the game); falke registers itself with ReShade as an add-on (it shows
+  up in ReShade's Add-ons tab as falke) and reads the frame just before it is presented.
+  - Effects that run behind the game (DLSS, temporal AA, ...) show a frame or more late, so
+    every output frame is drawn again, the world held still, for **Settle** frames before
+    it is saved. 2 is enough with the DLSS 5 feeder; raise it if frames come out one step
+    late (a stutter where two frames are the same), lower it to capture faster.
+  - falke's overlay would be in the frames, so it hides while capturing. Press **End** to
+    stop early. Close ReShade's own overlay too, and turn off its clock / FPS display: they
+    are drawn into the same image.
+  - HDR (HDR10 or scRGB swap chains) is brought down to SDR with 203 nits as white.
+  - The Skater matte compares two renders of the same moment. Neural rendering and
+    temporal effects do not draw them exactly alike, so the matte gets noisier: raise
+    "Skater threshold", or capture the matte with **Game**.
+  - Depth is always read from the game.
 
 ### How a replay works
 A `.flk` file stores the skater's bone poses and the camera, frame by frame. It does
