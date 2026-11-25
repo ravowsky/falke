@@ -28,6 +28,11 @@ Unreleased
 - Replay format version 5: every frame stores when it was captured, so frames the game took longer for (hitches) play back at their real pace instead of as a lurch; frames identical to the one before are not stored. Versions 3 and 4 still load
 - Release zip has a `rethawed` folder (falke.asi and the ASI loader)
 - Overlay no longer crashes the game with "unable to draw indexed prims" (D3DERR_INVALIDCALL) when the game ends its frame with a depth buffer of another size, extra render targets or instancing bound, or when the window is larger than the back buffer (some resolutions / DPI scaling). A draw that still fails skips that frame's UI instead of crashing. egui-d3d9 is now vendored in `egui-d3d9/` (changes in `egui-d3d9/FALKE-PATCHES.md`)
+- Frame-locked video capture (Capture window): the replay, camera path and game world move on by exactly one output frame per drawn frame, at any frame rate (e.g. 500 fps) and speed, so nothing is dropped or doubled
+  - ProRes 4444 / ProRes 422 HQ / H.264 through ffmpeg (`ffmpeg.exe` next to the game), or PNG / TGA sequences without ffmpeg
+  - Passes (THAW): Image, Depth (16-bit PNG, linear distance, read from the depth buffer swapped for a readable INTZ one while capturing), World (redrawn without the skater, world held still), Skater (the image with alpha where it differs from World)
+  - Output in `Captures\<name>\` next to the game
+- Bone camera mode (THAW): the camera rides one of the replayed skater's bones (board cam, head cam), with offset, turn, horizon levelling and stabilizing; bones can be picked by clicking their numbers on screen
 - Faster replay loading
 - Game backends can provide their own skater blending and world time scale
 

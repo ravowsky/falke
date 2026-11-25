@@ -10,12 +10,11 @@ Supported games:
 ## Features
 - Enhances the Free Cam to play interpolated camera paths between placeable keyframes
   (position, rotation and FOV).
-- Three camera modes to shoot in, fly it yourself, ride the replay's own camera, or
-  orbit the skater.
+- Four camera modes to shoot in: fly it yourself, ride the replay's own camera, orbit the
+  skater, or fix the camera to one of the skater's bones.
 - Basic replay recording and playback.
-
-There is no video export. You frame the shot with falke and capture it with OBS or
-whatever else you record with.
+- Frame-locked video capture of the replay (THAW / reTHAWed): any frame rate, no dropped
+  frames, with depth, world-only and skater-only passes.
 
 ## Installation
 I recommend using the "Ultimate ASI Loader"
@@ -61,8 +60,10 @@ hide it right before you start capturing.
    hit **➕ Add**. You need at least two keyframes at different times for a playable
    path. Markers can be dragged. **Delete** removes the selected one.
 4. **Play it.** **SPACE** plays and pauses.
-5. **Capture it.** Park the playhead a couple of seconds before the first keyframe,
-   press Space, then F1 to hide the UI, and record your screen.
+5. **Capture it.** Open the **Capture** window, pick a name, format, frame rate and range,
+   and press **🎬 Capture** (see [Capture](#capture)). Or park the playhead a couple of
+   seconds before the first keyframe, press Space, then F1 to hide the UI, and record your
+   screen.
 
 You cannot record a replay and author a camera path at the same time. falke leaves the
 camera alone while recording, so the camera you shoot with is the one you fly
@@ -76,12 +77,51 @@ They are mutually exclusive, and each one ignores what another uses:
 | Freecam | your keyframe path | the replay's recorded camera |
 | POV | the camera the replay was shot with | your keyframes (needs a replay loaded) |
 | Orbit | drag to circle the skater, or the path, whichever got the last input | nothing |
+| Bone | one of the replayed skater's bones, with an offset (THAW) | your keyframes (needs a replay loaded) |
 
 So "my keyframes do nothing" usually means you are in POV, and "my replay's camera was
 never recorded" usually means you are in Freecam.
 
 In orbit mode the pivot is the skater whenever a replay is supplying one, and a point in
 the level otherwise. Drag to orbit, shift+drag to pan, wheel to zoom.
+
+### Bone camera
+Pick **Bone** as the camera mode and the camera rides one of the replayed skater's bones:
+a board cam, a head cam, a hand cam. With **Show** ticked, every bone's number is drawn
+over the game; click one to pick it, or step through them with ◀ ▶. **Offset** moves the
+camera along the bone's own axes, **Turn** turns it (yaw, pitch, roll).
+**Turn with the bone** off keeps only the bone's position (the camera looks the way Turn
+says, in the world). **Keep the horizon level** drops any roll. **Stabilize** smooths the
+bone's motion over that many seconds of the replay (also in captures, it is worked out
+from the replay, not from the frame rate).
+
+### Capture
+The **Capture** window (freecam, overlay on) renders the replay to files, one frame at a
+time: falke moves the replay, the camera and the game world on by exactly one output frame
+for every frame the game draws, however long saving takes. So 500 fps is as smooth as
+30 fps, and nothing is dropped or doubled. The overlay is not in the captured frames.
+
+- **Format:** ProRes 4444, ProRes 422 HQ or H.264 need `ffmpeg.exe` next to the game's exe
+  (or on the PATH); PNG and TGA sequences do not. Everything goes to
+  `Captures\<name>\` next to the game.
+- **Frame rate** and **Speed:** speed 0.1 at 60 fps gives ten times slow motion at
+  60 fps; speed 1 at 500 fps gives footage to slow down later.
+- **From / to:** the replay time range (**All**: the whole replay and path).
+- **Passes** (THAW / reTHAWed):
+  - **Image**: what the game draws.
+  - **Depth**: 16-bit PNGs, black at the camera, white at the distance set under
+    "Depth white at" (game units). For depth of field or fog in an editor. Needs a graphics
+    driver with readable depth buffers (INTZ), and no anti-aliasing on the game's depth
+    buffer.
+  - **World**: every frame drawn a second time with the skater hidden (the world held
+    still in between).
+  - **Skater**: the image with an alpha channel that keeps only where Image and World
+    differ: the skater, and what it changes (its shadow, reflections). ProRes 4444 or PNG
+    keep the alpha; with H.264 this pass is written as PNGs.
+
+Captures read the game's own frame (Direct3D 9). Effects added further down the chain are
+not in them: with dgVoodoo set to DirectX 11, ReShade, DLSS or RenoDX running on the
+DirectX 11 side are not captured.
 
 ### How a replay works
 A `.flk` file stores the skater's bone poses and the camera, frame by frame. It does
@@ -105,3 +145,6 @@ plugins folder. For THPS4 you need d3d8to9 as Reshade only works with Direct3D 9
 - During playback the live skater is still standing where you left it and the game keeps
   drawing it, so panning the camera past that spot brings a second skater into shot.
 - One skater per replay.
+- Capture passes other than Image, and the bone camera, are for THAW / reTHAWed only.
+- The Depth pass reads the depth buffer the game draws the level with. Anything the game
+  draws with its depth buffer cleared afterwards (the HUD) is not in it.

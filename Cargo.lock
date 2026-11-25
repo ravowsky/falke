@@ -417,6 +417,7 @@ dependencies = [
  "egui_extras",
  "log",
  "nalgebra-glm",
+ "png",
  "retour",
  "simplelog",
  "thiserror",
