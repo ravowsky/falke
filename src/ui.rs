@@ -1077,11 +1077,15 @@ impl UiSystem {
                                 ui.selectable_value(&mut c.final_image, false, "Game")
                                     .on_hover_text("The game's own image, before ReShade");
                                 ui.add_enabled_ui(reshade.is_ok(), |ui| {
-                                    ui.selectable_value(&mut c.final_image, true, "Screen")
+                                    let r = ui
+                                        .selectable_value(&mut c.final_image, true, "Screen")
                                         .on_hover_text(
                                             "What reaches the screen: after ReShade and its \
                                              add-ons (DLSS, RenoDX, ...)",
                                         );
+                                    if let Err(e) = &reshade {
+                                        r.on_disabled_hover_text(e.as_str());
+                                    }
                                 });
                             });
                     });

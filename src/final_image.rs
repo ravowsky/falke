@@ -20,7 +20,7 @@ use windows::{
         Foundation::HMODULE,
         Graphics::{
             Direct3D11::*,
-            Dxgi::{Common::*, IDXGISwapChain},
+            Dxgi::{Common::*, IDXGIOutput6, IDXGISwapChain},
         },
         System::{
             LibraryLoader::{
@@ -40,9 +40,15 @@ const EVENT_RESHADE_PRESENT: u32 = 75;
 const API_VERSION: u32 = 1;
 /// `reshade::api::device_api::d3d11`.
 const API_D3D11: u32 = 0xb000;
-/// `reshade::api::color_space`.
-const COLOR_SPACE_SCRGB: u32 = 2;
-const COLOR_SPACE_HDR10_PQ: u32 = 3;
+/// How the swap chain's numbers are to be read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Encoding {
+    Sdr,
+    /// HDR10: BT.2020 primaries, PQ.
+    Pq,
+    /// Linear BT.709, 1.0 = 80 nits.
+    Scrgb,
+}
 /// HDR is brought down to SDR with this many nits as white (ITU-R BT.2408 reference white).
 const PAPER_WHITE_NITS: f32 = 203.0;
 
@@ -216,10 +222,12 @@ unsafe fn virtual_call<R>(object: *mut c_void, index: usize) -> R {
 
 /// The back buffer of a ReShade effect runtime, as BGRA.
 unsafe fn read_runtime(runtime: *mut c_void) -> Result<(u32, u32, Vec<u8>)> {
-    // effect_runtime : swapchain : device_object : api_object
-    //   0 get_native, 1 get_private_data, 2 set_private_data, 3 get_device, ..., 9 get_color_space
+    // effect_runtime : device_object : api_object
+    //   0 get_native (the runtime's IDXGISwapChain), 1 get_private_data,
+    //   2 set_private_data, 3 get_device, 4 get_hwnd, ...
     // device : api_object
     //   3 get_api
+    // Only these, which take no arguments, are called.
     let device: *mut c_void = unsafe { virtual_call(runtime, 3) };
     if device.is_null() {
         bail!("ReShade gave no device");
@@ -235,9 +243,8 @@ unsafe fn read_runtime(runtime: *mut c_void) -> Result<(u32, u32, Vec<u8>)> {
     let raw = native as usize as *mut c_void;
     let swapchain = unsafe { IDXGISwapChain::from_raw_borrowed(&raw) }
         .context("ReShade gave no swap chain")?;
-    let color_space: u32 = unsafe { virtual_call(runtime, 9) };
 
-    unsafe { read_back_buffer(swapchain, color_space) }
+    unsafe { read_back_buffer(swapchain) }
 }
 
 struct Staging {
@@ -257,10 +264,23 @@ fn staging() -> MutexGuard<'static, Option<Staging>> {
     STAGING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-unsafe fn read_back_buffer(
-    swapchain: &IDXGISwapChain,
-    color_space: u32,
-) -> Result<(u32, u32, Vec<u8>)> {
+/// Whether the swap chain's display is in HDR (Windows HDR on): a 10-bit or float swap chain
+/// presented to it holds HDR10 or scRGB, and SDR otherwise.
+unsafe fn display_is_hdr(swapchain: &IDXGISwapChain) -> bool {
+    unsafe {
+        let Ok(output) = swapchain.GetContainingOutput() else {
+            return false;
+        };
+        let Ok(output6) = output.cast::<IDXGIOutput6>() else {
+            return false;
+        };
+        output6
+            .GetDesc1()
+            .is_ok_and(|d| d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+    }
+}
+
+unsafe fn read_back_buffer(swapchain: &IDXGISwapChain) -> Result<(u32, u32, Vec<u8>)> {
     unsafe {
         let back: ID3D11Texture2D = swapchain.GetBuffer(0).context("GetBuffer")?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -342,14 +362,19 @@ unsafe fn read_back_buffer(
         context.Unmap(&s.staging, 0);
         drop(guard);
 
-        let bgra = to_bgra(&raw, desc.Format, color_space)?;
+        let encoding = match desc.Format {
+            DXGI_FORMAT_R10G10B10A2_UNORM if display_is_hdr(swapchain) => Encoding::Pq,
+            DXGI_FORMAT_R16G16B16A16_FLOAT if display_is_hdr(swapchain) => Encoding::Scrgb,
+            _ => Encoding::Sdr,
+        };
+        let bgra = to_bgra(&raw, desc.Format, encoding)?;
         Ok((desc.Width, desc.Height, bgra))
     }
 }
 
 // Formats
 
-fn to_bgra(raw: &[u8], format: DXGI_FORMAT, color_space: u32) -> Result<Vec<u8>> {
+fn to_bgra(raw: &[u8], format: DXGI_FORMAT, encoding: Encoding) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(raw.len());
     match format {
         DXGI_FORMAT_B8G8R8A8_UNORM
@@ -366,7 +391,7 @@ fn to_bgra(raw: &[u8], format: DXGI_FORMAT, color_space: u32) -> Result<Vec<u8>>
             }
         }
         DXGI_FORMAT_R10G10B10A2_UNORM => {
-            let pq = color_space == COLOR_SPACE_HDR10_PQ;
+            let pq = encoding == Encoding::Pq;
             for p in raw.chunks_exact(4) {
                 let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
                 let c = [v & 1023, (v >> 10) & 1023, (v >> 20) & 1023];
@@ -382,7 +407,7 @@ fn to_bgra(raw: &[u8], format: DXGI_FORMAT, color_space: u32) -> Result<Vec<u8>>
         DXGI_FORMAT_R16G16B16A16_FLOAT => {
             // scRGB: linear BT.709, 1.0 = 80 nits. An SDR swap chain in this format holds
             // 1.0 as white.
-            let hdr = color_space == COLOR_SPACE_SCRGB;
+            let hdr = encoding == Encoding::Scrgb;
             let scale = if hdr { 80.0 / PAPER_WHITE_NITS } else { 1.0 };
             for p in raw.chunks_exact(8) {
                 let ch = |i: usize| half_to_f32(u16::from_le_bytes([p[i], p[i + 1]])) * scale;
@@ -482,7 +507,7 @@ mod tests {
 
     #[test]
     fn rgba_swaps_to_bgra() {
-        let out = to_bgra(&[1, 2, 3, 4], DXGI_FORMAT_R8G8B8A8_UNORM, 0).unwrap();
+        let out = to_bgra(&[1, 2, 3, 4], DXGI_FORMAT_R8G8B8A8_UNORM, Encoding::Sdr).unwrap();
         assert_eq!(out, [3, 2, 1, 255]);
     }
 }
