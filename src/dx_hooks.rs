@@ -26,7 +26,7 @@ use windows::{
 };
 
 use crate::{
-    capture, game,
+    capture, final_image, game,
     ui::{UI_SYSTEM, ui_render_loop},
     video,
 };
@@ -96,10 +96,20 @@ fn hk_present(
             AppCell(Mutex::new(app))
         });
 
+        // ReShade (if any) is told about falke before the first frame reaches it, while
+        // nothing is presenting yet.
+        static CONNECT: std::sync::Once = std::sync::Once::new();
+        CONNECT.call_once(|| {
+            let _ = final_image::connect();
+        });
+
         // Read the frame for a running capture before the overlay is drawn on it.
         video::on_present(&dev);
 
-        cell.0.lock().unwrap().present(&dev);
+        // A capture of the final image (after ReShade) would have the overlay in it.
+        if !video::hides_overlay() {
+            cell.0.lock().unwrap().present(&dev);
+        }
 
         PresentHook.call(dev, source_rect, dest_rect, window, rgn_data)
     }
@@ -125,6 +135,13 @@ unsafe extern "stdcall" fn hk_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // The overlay is hidden while the final image is captured: End stops it.
+    const WM_KEYDOWN: u32 = 0x0100;
+    const VK_END: usize = 0x23;
+    if msg == WM_KEYDOWN && wparam.0 == VK_END && video::hides_overlay() {
+        video::request_stop();
+    }
+
     if let Some(cell) = APP.get() {
         cell.0.lock().unwrap().wnd_proc(msg, wparam, lparam);
     }

@@ -24,6 +24,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
     thread::JoinHandle,
@@ -33,7 +34,7 @@ use anyhow::{Context, Result, bail};
 use windows::Win32::Graphics::Direct3D9::*;
 use windows::core::Interface;
 
-use crate::game;
+use crate::{final_image, game};
 
 // Settings
 
@@ -94,6 +95,12 @@ pub struct Settings {
     /// How different (0-255, any colour channel) Image and World must be for a pixel to
     /// count as the skater.
     pub matte_threshold: u8,
+    /// Image, World and Skater from what reaches the screen (after ReShade and its add-ons:
+    /// DLSS, RenoDX, ...) instead of the game's own image. See `final_image`.
+    pub final_image: bool,
+    /// With `final_image`: frames each step is drawn again (the world held still) before it
+    /// is read, so effects that lag behind the game (DLSS, temporal AA) have caught up.
+    pub settle: u32,
 }
 
 impl Default for Settings {
@@ -111,6 +118,8 @@ impl Default for Settings {
             skater: false,
             depth_far: 3000.0,
             matte_threshold: 6,
+            final_image: false,
+            settle: 2,
         }
     }
 }
@@ -217,9 +226,21 @@ struct Session {
     writer: Option<Writer>,
     /// The Image pass of the frame whose NoSkater pass is still to come.
     held: Option<Vec<u8>>,
-    /// A single frame shown in the Capture window instead of saved (see `start_preview`).
-    preview: Option<PreviewPass>,
+    /// How many frames before showed the same step as `set_up` / `shown`: with
+    /// `final_image` a step is drawn again until its final image has been read.
+    set_up_hold: u32,
+    shown_hold: u32,
+    /// The step set up last (repeated while it is held).
+    current: Option<Step>,
+    /// The last step whose final image has been read.
+    final_read: Option<Step>,
 }
+
+/// Stop asked for from the keyboard (the overlay is hidden during a final-image capture).
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Frames a step may wait for its final image before the capture gives up.
+const FINAL_IMAGE_PATIENCE: u32 = 300;
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static LAST_STATUS: Mutex<Option<Status>> = Mutex::new(None);
@@ -247,9 +268,19 @@ pub fn start(settings: Settings) -> Result<()> {
         } else {
             None
         };
+    if settings.final_image {
+        final_image::connect().map_err(|e| {
+            anyhow::anyhow!("{e} (or set Image from to Game)")
+        })?;
+        final_image::reset();
+    }
+    STOP_REQUESTED.store(false, Ordering::Relaxed);
     let folder = folder_of(settings.name.trim());
     std::fs::create_dir_all(&folder)
         .with_context(|| format!("could not create {}", folder.display()))?;
+
+    // The capture sets up its own passes.
+    set_view(View::Image);
 
     let total = settings.frame_count();
     log::info!(
@@ -275,177 +306,13 @@ pub fn start(settings: Settings) -> Result<()> {
         done: 0,
         gpu: None,
         held: None,
-        preview: None,
+        set_up_hold: 0,
+        shown_hold: 0,
+        current: None,
+        final_read: None,
     });
     *LAST_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
-}
-
-// Previews
-
-/// A pass to preview.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PreviewPass {
-    Image,
-    Depth,
-    World,
-    Skater,
-}
-
-impl PreviewPass {
-    pub const ALL: [PreviewPass; 4] = [
-        PreviewPass::Image,
-        PreviewPass::Depth,
-        PreviewPass::World,
-        PreviewPass::Skater,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            PreviewPass::Image => "Image",
-            PreviewPass::Depth => "Depth",
-            PreviewPass::World => "World",
-            PreviewPass::Skater => "Skater",
-        }
-    }
-}
-
-/// A previewed pass, RGBA, scaled down to at most `PREVIEW_WIDTH` wide.
-pub struct Preview {
-    pub pass: PreviewPass,
-    pub size: (u32, u32),
-    pub rgba: Vec<u8>,
-    /// Counts up with every new preview.
-    pub generation: u64,
-}
-
-const PREVIEW_WIDTH: u32 = 1280;
-
-static PREVIEW: Mutex<Option<Preview>> = Mutex::new(None);
-static PREVIEW_ERROR: Mutex<Option<String>> = Mutex::new(None);
-static PREVIEW_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Draw the frame at replay time `time` once, through the same passes as a capture, and
-/// keep `pass` to show instead of saving anything. The world is held still.
-pub fn start_preview(base: &Settings, time: f32, pass: PreviewPass) -> Result<()> {
-    let mut guard = session();
-    if guard.is_some() {
-        bail!("a capture is running");
-    }
-    let settings = Settings {
-        start: time,
-        end: time,
-        image: pass == PreviewPass::Image,
-        depth: pass == PreviewPass::Depth,
-        world: pass == PreviewPass::World,
-        skater: pass == PreviewPass::Skater,
-        ..base.clone()
-    };
-    *PREVIEW_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *guard = Some(Session {
-        writer: None,
-        total: 1,
-        settings,
-        folder: PathBuf::new(),
-        next: Some(Step {
-            frame: 0,
-            pass: Pass::Main,
-        }),
-        shown: None,
-        set_up: None,
-        done: 0,
-        gpu: None,
-        held: None,
-        preview: Some(pass),
-    });
-    Ok(())
-}
-
-/// The latest preview, if it is newer than `seen` (its generation).
-pub fn take_preview(seen: u64) -> Option<Preview> {
-    let mut guard = PREVIEW.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.as_ref().is_some_and(|p| p.generation > seen) {
-        guard.take()
-    } else {
-        None
-    }
-}
-
-/// Why the last preview failed.
-pub fn preview_error() -> Option<String> {
-    PREVIEW_ERROR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-/// Whether a preview is being drawn.
-pub fn preview_running() -> bool {
-    session().as_ref().is_some_and(|s| s.preview.is_some())
-}
-
-/// Keep a pass's output as the preview (scaled down, alpha over a checkerboard, depth as
-/// grey).
-fn keep_preview(pass: PreviewPass, job: Job) {
-    let (size, rgba) = match job {
-        Job::Color {
-            size, bgra, alpha, ..
-        } => {
-            let mut rgba = Vec::with_capacity(bgra.len());
-            for (i, px) in bgra.chunks_exact(4).enumerate() {
-                let (x, y) = (i as u32 % size.0, i as u32 / size.0);
-                let a = if alpha { px[3] as u32 } else { 255 };
-                let check = if ((x / 16) + (y / 16)) % 2 == 0 {
-                    0x60
-                } else {
-                    0x90
-                };
-                for c in [2, 1, 0] {
-                    rgba.push(((px[c] as u32 * a + check * (255 - a)) / 255) as u8);
-                }
-                rgba.push(255);
-            }
-            (size, rgba)
-        }
-        Job::Depth { size, depth, .. } => {
-            let mut rgba = Vec::with_capacity(depth.len() * 4);
-            for v in depth {
-                let g = (v >> 8) as u8;
-                rgba.extend_from_slice(&[g, g, g, 255]);
-            }
-            (size, rgba)
-        }
-    };
-    let (size, rgba) = shrink(size, rgba);
-    let generation = PREVIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    *PREVIEW.lock().unwrap_or_else(|e| e.into_inner()) = Some(Preview {
-        pass,
-        size,
-        rgba,
-        generation,
-    });
-}
-
-/// Halve an RGBA image (box filter) until it is at most `PREVIEW_WIDTH` wide.
-fn shrink(mut size: (u32, u32), mut rgba: Vec<u8>) -> ((u32, u32), Vec<u8>) {
-    while size.0 > PREVIEW_WIDTH && size.0 >= 2 && size.1 >= 2 {
-        let (w, h) = (size.0 / 2, size.1 / 2);
-        let src_w = size.0 as usize;
-        let mut out = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h as usize {
-            for x in 0..w as usize {
-                for c in 0..4 {
-                    let at = |dx: usize, dy: usize| {
-                        rgba[((2 * y + dy) * src_w + 2 * x + dx) * 4 + c] as u32
-                    };
-                    out.push(((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) / 4) as u8);
-                }
-            }
-        }
-        size = (w, h);
-        rgba = out;
-    }
-    (size, rgba)
 }
 
 /// Stop capturing (finishing the files written so far).
@@ -457,17 +324,6 @@ pub fn stop() {
 }
 
 fn finish(mut s: Session, error: Option<String>) {
-    if s.preview.is_some() {
-        if let Some(gpu) = s.gpu.take() {
-            gpu.release();
-        }
-        game::set_skater_hidden(false);
-        if let Some(e) = error {
-            log::warn!("[capture] preview failed: {e}");
-            *PREVIEW_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
-        }
-        return;
-    }
     let mut error = error;
     if let Some(w) = s.writer.take() {
         if let Err(e) = w.finish() {
@@ -476,6 +332,9 @@ fn finish(mut s: Session, error: Option<String>) {
     }
     if let Some(gpu) = s.gpu.take() {
         gpu.release();
+    }
+    if s.settings.final_image {
+        final_image::reset();
     }
     game::set_skater_hidden(false);
     match &error {
@@ -496,7 +355,7 @@ fn finish(mut s: Session, error: Option<String>) {
 }
 
 pub fn status() -> Option<Status> {
-    if let Some(s) = session().as_ref().filter(|s| s.preview.is_none()) {
+    if let Some(s) = session().as_ref() {
         return Some(Status {
             running: true,
             done: s.done,
@@ -517,15 +376,24 @@ pub fn plan() -> Option<Plan> {
     let mut guard = session();
     let s = guard.as_mut()?;
     if s.set_up.is_none() {
-        s.set_up = s.next.take();
-        s.next = s
-            .set_up
-            .and_then(|step| successor(&s.settings, s.total, step));
+        let waiting = s.settings.final_image && s.current.is_some() && s.final_read != s.current;
+        if waiting {
+            // Drawn again, the world held still, until its final image has been read.
+            s.set_up = s.current;
+            s.set_up_hold += 1;
+        } else {
+            s.set_up = s.next.take();
+            s.set_up_hold = 0;
+            s.current = s.set_up;
+            s.next = s
+                .set_up
+                .and_then(|step| successor(&s.settings, s.total, step));
+        }
     }
     let step = s.set_up?;
     let world_speed = match step.pass {
-        // A preview is a moment, not a stretch of the replay.
-        _ if s.preview.is_some() => 0.0,
+        // Drawn again: the same moment.
+        _ if s.set_up_hold > 0 => 0.0,
         // One output frame of game time a drawn frame (the game runs 60 frames a second).
         Pass::Main => s.settings.speed * 60.0 / s.settings.fps as f32,
         // Held (nearly) still: the same moment drawn again.
@@ -555,9 +423,21 @@ fn successor(settings: &Settings, total: u32, step: Step) -> Option<Step> {
 /// Called at `Present`, before the overlay is drawn: reads the frame just drawn.
 pub fn on_present(dev: &IDirect3DDevice9) {
     let mut guard = session();
-    let Some(s) = guard.as_mut() else { return };
-    let result = unsafe { present_step(s, dev) };
+    let Some(s) = guard.as_mut() else {
+        drop(guard);
+        unsafe { present_view(dev) };
+        return;
+    };
+    let result = if STOP_REQUESTED.swap(false, Ordering::Relaxed) {
+        let s = guard.take().unwrap();
+        drop(guard);
+        finish(s, None);
+        return;
+    } else {
+        unsafe { present_step(s, dev) }
+    };
     s.shown = s.set_up.take();
+    s.shown_hold = s.set_up_hold;
     let finished = s.shown.is_none() && s.next.is_none() && s.done >= s.total;
     match result {
         Err(e) => {
@@ -578,28 +458,92 @@ unsafe fn present_step(s: &mut Session, dev: &IDirect3DDevice9) -> Result<()> {
     if s.gpu.is_none() {
         s.gpu = Some(unsafe { Gpu::new(dev, s.settings.depth)? });
     }
-    let Some(step) = s.shown else { return Ok(()) };
-    let gpu = s.gpu.as_mut().unwrap();
-    let (w, h) = (gpu.width, gpu.height);
     let mut jobs = Vec::new();
+    if s.settings.final_image {
+        unsafe { present_final(s, dev, &mut jobs)? };
+    } else if let Some(step) = s.shown {
+        let gpu = s.gpu.as_mut().unwrap();
+        let size = (gpu.width, gpu.height);
+        let image = unsafe { gpu.read_color(dev)? };
+        if step.pass == Pass::Main && s.settings.depth {
+            jobs.push(unsafe { read_depth_job(s, dev, step)? });
+        }
+        consume_color(s, step, image, size, &mut jobs)?;
+    }
+    let writer = s.writer.as_mut().context("no writer")?;
+    for job in jobs {
+        writer.send(job)?;
+    }
+    Ok(())
+}
+
+/// A final-image capture: depth is still read from the game, the colour passes come from
+/// the swap chain after ReShade, read on the present thread whenever it gets there.
+unsafe fn present_final(s: &mut Session, dev: &IDirect3DDevice9, jobs: &mut Vec<Job>) -> Result<()> {
+    if let Some(step) = s.shown {
+        if step.pass == Pass::Main && s.shown_hold == 0 && s.settings.depth {
+            jobs.push(unsafe { read_depth_job(s, dev, step)? });
+        }
+    }
+    // This frame and the `settle` before it all show the step: whatever the present thread
+    // shows next is it, even if it runs a little behind.
+    let wanted = s
+        .shown
+        .filter(|step| s.shown_hold >= s.settings.settle && s.final_read != Some(*step));
+    final_image::want(wanted.map(step_id));
+
+    let (frames, error) = final_image::take();
+    if let Some(e) = error {
+        bail!("final image: {e}");
+    }
+    for f in frames {
+        let step = step_of(f.id);
+        if s.final_read == Some(step) {
+            continue;
+        }
+        s.final_read = Some(step);
+        consume_color(s, step, f.bgra, (f.width, f.height), jobs)?;
+    }
+
+    if s.shown.is_some() && s.shown_hold > s.settings.settle + FINAL_IMAGE_PATIENCE {
+        if final_image::seen_present() {
+            bail!("the final image stopped arriving from ReShade");
+        }
+        bail!(
+            "no final image from ReShade: is the game presenting through ReShade (dgVoodoo's \
+             D3D11 output with ReShade as dxgi.dll)? Set Image from to Game to capture without it"
+        );
+    }
+    Ok(())
+}
+
+unsafe fn read_depth_job(s: &mut Session, dev: &IDirect3DDevice9, step: Step) -> Result<Job> {
+    let gpu = s.gpu.as_mut().context("no capture targets")?;
+    let raw = unsafe { gpu.read_depth(dev)? };
+    let (near, far) = game::depth_range().unwrap_or((2.0, 100_000.0));
+    Ok(Job::Depth {
+        frame: step.frame,
+        size: (gpu.width, gpu.height),
+        depth: depth16(&raw, near, far, s.settings.depth_far),
+    })
+}
+
+/// The colour image of a step: saved, or held for the matte until the NoSkater pass comes.
+fn consume_color(
+    s: &mut Session,
+    step: Step,
+    image: Vec<u8>,
+    size: (u32, u32),
+    jobs: &mut Vec<Job>,
+) -> Result<()> {
     match step.pass {
         Pass::Main => {
-            let image = unsafe { gpu.read_color(dev)? };
-            if s.settings.depth {
-                let raw = unsafe { gpu.read_depth(dev)? };
-                let (near, far) = game::depth_range().unwrap_or((2.0, 100_000.0));
-                jobs.push(Job::Depth {
-                    frame: step.frame,
-                    size: (w, h),
-                    depth: depth16(&raw, near, far, s.settings.depth_far),
-                });
-            }
             if s.settings.second_pass() {
                 if s.settings.image {
                     jobs.push(Job::Color {
                         pass: "image",
                         frame: step.frame,
-                        size: (w, h),
+                        size,
                         bgra: image.clone(),
                         alpha: false,
                     });
@@ -610,7 +554,7 @@ unsafe fn present_step(s: &mut Session, dev: &IDirect3DDevice9) -> Result<()> {
                     jobs.push(Job::Color {
                         pass: "image",
                         frame: step.frame,
-                        size: (w, h),
+                        size,
                         bgra: image,
                         alpha: false,
                     });
@@ -619,13 +563,16 @@ unsafe fn present_step(s: &mut Session, dev: &IDirect3DDevice9) -> Result<()> {
             }
         }
         Pass::NoSkater => {
-            let world = unsafe { gpu.read_color(dev)? };
+            let world = image;
             let image = s.held.take().context("the Image pass is missing")?;
+            if image.len() != world.len() {
+                bail!("the image changed size between the Image and World passes");
+            }
             if s.settings.skater {
                 jobs.push(Job::Color {
                     pass: "skater",
                     frame: step.frame,
-                    size: (w, h),
+                    size,
                     bgra: matte(&image, &world, s.settings.matte_threshold),
                     alpha: true,
                 });
@@ -634,7 +581,7 @@ unsafe fn present_step(s: &mut Session, dev: &IDirect3DDevice9) -> Result<()> {
                 jobs.push(Job::Color {
                     pass: "world",
                     frame: step.frame,
-                    size: (w, h),
+                    size,
                     bgra: world,
                     alpha: false,
                 });
@@ -642,18 +589,41 @@ unsafe fn present_step(s: &mut Session, dev: &IDirect3DDevice9) -> Result<()> {
             s.done = step.frame + 1;
         }
     }
-    for job in jobs {
-        match (s.preview, s.writer.as_mut()) {
-            (Some(pass), _) => keep_preview(pass, job),
-            (None, Some(writer)) => writer.send(job)?,
-            (None, None) => bail!("no writer"),
-        }
-    }
     Ok(())
+}
+
+fn step_id(step: Step) -> u64 {
+    (step.frame as u64) << 1 | (step.pass == Pass::NoSkater) as u64
+}
+
+fn step_of(id: u64) -> Step {
+    Step {
+        frame: (id >> 1) as u32,
+        pass: if id & 1 == 1 {
+            Pass::NoSkater
+        } else {
+            Pass::Main
+        },
+    }
+}
+
+/// A final-image capture is running: falke's overlay would end up in it, so it isn't drawn.
+pub fn hides_overlay() -> bool {
+    session()
+        .as_ref()
+        .is_some_and(|s| s.settings.final_image)
+}
+
+/// Stop the capture at the next frame (from the keyboard).
+pub fn request_stop() {
+    STOP_REQUESTED.store(true, Ordering::Relaxed);
 }
 
 /// The device is being reset: the capture's GPU resources are gone with it.
 pub fn on_reset() {
+    if let Some(v) = VIEW_GPU.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        v.release();
+    }
     let taken = session().take();
     if let Some(s) = taken {
         finish(
@@ -673,6 +643,327 @@ pub fn depth_substitute(surface: *mut core::ffi::c_void) -> Option<*mut core::ff
 
 /// The game's depth surface and ours (raw COM pointers; ours is kept alive by `Gpu`).
 static DEPTH_SWAP: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+// Viewing a pass in the game
+
+/// What the game shows: as drawn, or one of the capture passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Image,
+    Depth,
+    World,
+    Skater,
+}
+
+impl View {
+    pub const ALL: [View; 4] = [View::Image, View::Depth, View::World, View::Skater];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            View::Image => "Image",
+            View::Depth => "Depth",
+            View::World => "World",
+            View::Skater => "Skater",
+        }
+    }
+}
+
+/// The view, its settings, and whether the frame being drawn now is a Skater view frame
+/// without the skater (every other one).
+struct ViewState {
+    view: View,
+    depth_far: f32,
+    matte_threshold: u8,
+    hidden_frame: bool,
+}
+
+static VIEW: Mutex<ViewState> = Mutex::new(ViewState {
+    view: View::Image,
+    depth_far: 3000.0,
+    matte_threshold: 6,
+    hidden_frame: false,
+});
+static VIEW_GPU: Mutex<Option<ViewGpu>> = Mutex::new(None);
+static VIEW_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+fn view_state() -> std::sync::MutexGuard<'static, ViewState> {
+    VIEW.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Show `view` in the game from the next frame on.
+pub fn set_view(view: View) {
+    let mut v = view_state();
+    if v.view == view {
+        return;
+    }
+    v.view = view;
+    v.hidden_frame = false;
+    drop(v);
+    *VIEW_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // Set up again for the new view (the depth buffer swap only for Depth).
+    if let Some(g) = VIEW_GPU.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        g.release();
+    }
+    if view == View::Image {
+        game::set_skater_hidden(false);
+    }
+}
+
+pub fn view() -> View {
+    view_state().view
+}
+
+/// The Depth and Skater views follow these capture settings.
+pub fn set_view_settings(depth_far: f32, matte_threshold: u8) {
+    let mut v = view_state();
+    v.depth_far = depth_far;
+    v.matte_threshold = matte_threshold;
+}
+
+/// Why the view could not be shown (it has gone back to Image).
+pub fn view_error() -> Option<String> {
+    VIEW_ERROR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Whether the skater is to be hidden in the frame being set up now (called in `EndScene`
+/// while no capture runs).
+pub fn view_hides_skater() -> bool {
+    let v = view_state();
+    match v.view {
+        View::World => true,
+        // The Skater view draws every other frame without the skater, to compare.
+        View::Skater => !v.hidden_frame,
+        _ => false,
+    }
+}
+
+/// ps_2_0: the depth texture's value turned into a grey distance:
+/// `saturate(c0.z / (c0.y + z * c0.x))`, alpha `c0.w`.
+const DEPTH_VIEW_SHADER: [u32; 26] = [
+    0xFFFF_0200, // ps_2_0
+    0x0200_001F,
+    0x8000_0000,
+    0xB003_0000, // dcl t0.xy
+    0x0200_001F,
+    0x9000_0000,
+    0xA00F_0800, // dcl_2d s0
+    0x0300_0042,
+    0x800F_0000,
+    0xB0E4_0000,
+    0xA0E4_0800, // texld r0, t0, s0
+    0x0400_0004,
+    0x800F_0001,
+    0x8000_0000,
+    0xA000_0000,
+    0xA055_0000, // mad r1, r0.x, c0.x, c0.y
+    0x0200_0006,
+    0x800F_0001,
+    0x8000_0001, // rcp r1, r1.x
+    0x0300_0005,
+    0x801F_0001,
+    0x80E4_0001,
+    0xA0AA_0000, // mul_sat r1, r1, c0.z
+    0x0200_0001,
+    0x8008_0001,
+    0xA0FF_0000, // mov r1.w, c0.w
+];
+const DEPTH_VIEW_SHADER_END: [u32; 4] = [
+    0x0200_0001,
+    0x800F_0800,
+    0x80E4_0001, // mov oC0, r1
+    0x0000_FFFF, // end
+];
+
+/// What a view needs on the GPU: the capture's surfaces (and the depth swap for Depth),
+/// a shader, and for Skater a texture the composite is uploaded to.
+struct ViewGpu {
+    base: Gpu,
+    depth_shader: Option<IDirect3DPixelShader9>,
+    copy_shader: IDirect3DPixelShader9,
+    /// Skater view: the composite, in video memory and its upload copy.
+    shown: IDirect3DTexture9,
+    upload: IDirect3DTexture9,
+    /// Skater view: the last frame with the skater, and whether a composite exists yet.
+    held: Option<Vec<u8>>,
+    has_composite: bool,
+}
+
+unsafe impl Send for ViewGpu {}
+
+impl ViewGpu {
+    unsafe fn new(dev: &IDirect3DDevice9, view: View) -> Result<Self> {
+        unsafe {
+            let base = Gpu::new(dev, view == View::Depth)?;
+            let depth_shader = if view == View::Depth {
+                let code: Vec<u32> = DEPTH_VIEW_SHADER
+                    .iter()
+                    .chain(DEPTH_VIEW_SHADER_END.iter())
+                    .copied()
+                    .collect();
+                Some(
+                    dev.CreatePixelShader(code.as_ptr())
+                        .context("could not create the depth view shader")?,
+                )
+            } else {
+                None
+            };
+            let copy_shader = dev
+                .CreatePixelShader(COPY_SHADER.as_ptr())
+                .context("could not create the view shader")?;
+            let texture = |pool: D3DPOOL, usage: u32| -> Result<IDirect3DTexture9> {
+                let mut t = None;
+                dev.CreateTexture(
+                    base.width,
+                    base.height,
+                    1,
+                    usage,
+                    D3DFMT_A8R8G8B8,
+                    pool,
+                    &mut t,
+                    std::ptr::null_mut(),
+                )
+                .context("could not create the view texture")?;
+                t.context("no view texture")
+            };
+            Ok(Self {
+                shown: texture(D3DPOOL_DEFAULT, 0)?,
+                upload: texture(D3DPOOL_SYSTEMMEM, 0)?,
+                base,
+                depth_shader,
+                copy_shader,
+                held: None,
+                has_composite: false,
+            })
+        }
+    }
+
+    fn release(self) {
+        self.base.release();
+    }
+}
+
+/// Draws the view over the frame just drawn (before the overlay).
+unsafe fn present_view(dev: &IDirect3DDevice9) {
+    let (view, depth_far, threshold) = {
+        let v = view_state();
+        (v.view, v.depth_far, v.matte_threshold)
+    };
+    if matches!(view, View::Image | View::World) {
+        return;
+    }
+    let mut guard = VIEW_GPU.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        match unsafe { ViewGpu::new(dev, view) } {
+            Ok(g) => *guard = Some(g),
+            Err(e) => {
+                drop(guard);
+                log::warn!("[view] {e:#}");
+                set_view(View::Image);
+                *VIEW_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{e:#}"));
+                return;
+            }
+        }
+    }
+    let g = guard.as_mut().unwrap();
+    let result = unsafe {
+        match view {
+            View::Depth => view_depth(dev, g, depth_far),
+            _ => view_skater(dev, g, threshold),
+        }
+    };
+    drop(guard);
+    if let Err(e) = result {
+        log::warn!("[view] {e:#}");
+        set_view(View::Image);
+        *VIEW_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{e:#}"));
+    }
+}
+
+unsafe fn view_depth(dev: &IDirect3DDevice9, g: &ViewGpu, depth_far: f32) -> Result<()> {
+    let d = g.base.depth.as_ref().context("depth is not set up")?;
+    let shader = g.depth_shader.as_ref().context("no depth shader")?;
+    let (near, far) = game::depth_range().unwrap_or((2.0, 100_000.0));
+    // distance / depth_far = near * far / (far - z * (far - near)) / depth_far
+    let consts = [-(far - near), far, near * far / depth_far.max(1.0), 1.0];
+    unsafe {
+        let back = dev.GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO)?;
+        fullscreen_pass(
+            dev,
+            &back,
+            (g.base.width, g.base.height),
+            &d.texture,
+            shader,
+            Some(consts),
+        )
+    }
+}
+
+/// Every other frame is drawn without the skater; the pair gives the Skater pass, which is
+/// shown on both (so the screen does not flicker between the two).
+unsafe fn view_skater(dev: &IDirect3DDevice9, g: &mut ViewGpu, threshold: u8) -> Result<()> {
+    let hidden = {
+        let mut v = view_state();
+        // The frame just drawn was set up by `view_hides_skater` one frame ago.
+        let hidden = v.hidden_frame;
+        v.hidden_frame = !hidden;
+        hidden
+    };
+    unsafe {
+        let frame = g.base.read_color(dev)?;
+        if hidden {
+            if let Some(image) = g.held.take() {
+                let composite = checkered(&matte(&image, &frame, threshold), g.base.width);
+                let surface = g.upload.GetSurfaceLevel(0)?;
+                let mut locked = D3DLOCKED_RECT::default();
+                surface.LockRect(&mut locked, std::ptr::null(), 0)?;
+                let row = g.base.width as usize * 4;
+                for y in 0..g.base.height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        composite.as_ptr().add(y * row),
+                        (locked.pBits as *mut u8).add(y * locked.Pitch as usize),
+                        row,
+                    );
+                }
+                let _ = surface.UnlockRect();
+                dev.UpdateTexture(&g.upload, &g.shown)?;
+                g.has_composite = true;
+            }
+        } else {
+            g.held = Some(frame);
+        }
+        if g.has_composite {
+            let back = dev.GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO)?;
+            fullscreen_pass(
+                dev,
+                &back,
+                (g.base.width, g.base.height),
+                &g.shown,
+                &g.copy_shader,
+                None,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// A BGRA image with alpha shown over a grey checkerboard, opaque.
+fn checkered(bgra: &[u8], width: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bgra.len());
+    for (i, px) in bgra.chunks_exact(4).enumerate() {
+        let (x, y) = (i as u32 % width, i as u32 / width);
+        let a = px[3] as u32;
+        let check = if ((x / 16) + (y / 16)) % 2 == 0 {
+            0x60
+        } else {
+            0x90
+        };
+        for c in 0..3 {
+            out.push(((px[c] as u32 * a + check * (255 - a)) / 255) as u8);
+        }
+        out.push(255);
+    }
+    out
+}
 
 // Image maths
 
@@ -837,76 +1128,15 @@ impl Gpu {
             bail!("depth is not set up")
         };
         unsafe {
-            let state = dev.CreateStateBlock(D3DSBT_ALL)?;
-            let old_target = dev.GetRenderTarget(0).ok();
-            let old_depth = dev.GetDepthStencilSurface().ok();
-
-            // The depth texture cannot be read while it is bound as the depth buffer.
-            dev.SetDepthStencilSurface(None)?;
-            dev.SetRenderTarget(0, &d.target)?;
-            let vp = D3DVIEWPORT9 {
-                X: 0,
-                Y: 0,
-                Width: self.width,
-                Height: self.height,
-                MinZ: 0.0,
-                MaxZ: 1.0,
-            };
-            dev.SetViewport(&vp)?;
-            dev.SetVertexShader(None)?;
-            dev.SetPixelShader(&d.shader)?;
-            dev.SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1)?;
-            dev.SetTexture(0, &d.texture)?;
-            for (state, value) in [
-                (D3DSAMP_MINFILTER, D3DTEXF_POINT.0 as u32),
-                (D3DSAMP_MAGFILTER, D3DTEXF_POINT.0 as u32),
-                (D3DSAMP_MIPFILTER, D3DTEXF_NONE.0 as u32),
-                (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP.0 as u32),
-                (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP.0 as u32),
-                (D3DSAMP_SRGBTEXTURE, 0),
-            ] {
-                dev.SetSamplerState(0, state, value)?;
-            }
-            for (state, value) in [
-                (D3DRS_ZENABLE, 0),
-                (D3DRS_ZWRITEENABLE, 0),
-                (D3DRS_CULLMODE, D3DCULL_NONE.0 as u32),
-                (D3DRS_ALPHABLENDENABLE, 0),
-                (D3DRS_ALPHATESTENABLE, 0),
-                (D3DRS_STENCILENABLE, 0),
-                (D3DRS_SCISSORTESTENABLE, 0),
-                (D3DRS_FOGENABLE, 0),
-                (D3DRS_COLORWRITEENABLE, 0xF),
-                (D3DRS_SRGBWRITEENABLE, 0),
-            ] {
-                dev.SetRenderState(state, value)?;
-            }
-            let (w, h) = (self.width as f32, self.height as f32);
-            #[rustfmt::skip]
-            let quad: [f32; 24] = [
-                -0.5,     -0.5,     0.0, 1.0, 0.0, 0.0,
-                w - 0.5,  -0.5,     0.0, 1.0, 1.0, 0.0,
-                -0.5,     h - 0.5,  0.0, 1.0, 0.0, 1.0,
-                w - 0.5,  h - 0.5,  0.0, 1.0, 1.0, 1.0,
-            ];
-            dev.BeginScene()?;
-            let drawn = dev.DrawPrimitiveUP(
-                D3DPT_TRIANGLESTRIP,
-                2,
-                quad.as_ptr().cast(),
-                (6 * std::mem::size_of::<f32>()) as u32,
-            );
-            crate::dx_hooks::end_scene_unhooked(dev);
-
-            // Put everything back before checking how it went.
-            dev.SetTexture(0, None)?;
-            if let Some(t) = &old_target {
-                dev.SetRenderTarget(0, t)?;
-            }
-            dev.SetDepthStencilSurface(old_depth.as_ref())?;
-            state.Apply()?;
-            drawn.context("could not draw the depth")?;
-
+            fullscreen_pass(
+                dev,
+                &d.target,
+                (self.width, self.height),
+                &d.texture,
+                &d.shader,
+                None,
+            )
+            .context("could not draw the depth")?;
             dev.GetRenderTargetData(&d.target, &d.system)
                 .context("could not read the depth")?;
             let bytes = read_surface(&d.system, self.width, self.height, 4)?;
@@ -1032,6 +1262,93 @@ impl DepthGpu {
                 }
             }
         }
+    }
+}
+
+/// Draws `texture` through `shader` over all of `target` (its constant c0 set to `consts`),
+/// leaving the device's state as it was. The depth buffer is unbound meanwhile (the
+/// readable depth texture cannot be read while bound).
+unsafe fn fullscreen_pass(
+    dev: &IDirect3DDevice9,
+    target: &IDirect3DSurface9,
+    (width, height): (u32, u32),
+    texture: &IDirect3DTexture9,
+    shader: &IDirect3DPixelShader9,
+    consts: Option<[f32; 4]>,
+) -> Result<()> {
+    unsafe {
+        let state = dev.CreateStateBlock(D3DSBT_ALL)?;
+        let old_target = dev.GetRenderTarget(0).ok();
+        let old_depth = dev.GetDepthStencilSurface().ok();
+
+        dev.SetDepthStencilSurface(None)?;
+        dev.SetRenderTarget(0, target)?;
+        let vp = D3DVIEWPORT9 {
+            X: 0,
+            Y: 0,
+            Width: width,
+            Height: height,
+            MinZ: 0.0,
+            MaxZ: 1.0,
+        };
+        dev.SetViewport(&vp)?;
+        dev.SetVertexShader(None)?;
+        dev.SetPixelShader(shader)?;
+        if let Some(c) = consts {
+            dev.SetPixelShaderConstantF(0, c.as_ptr(), 1)?;
+        }
+        dev.SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1)?;
+        dev.SetTexture(0, texture)?;
+        for (state, value) in [
+            (D3DSAMP_MINFILTER, D3DTEXF_POINT.0 as u32),
+            (D3DSAMP_MAGFILTER, D3DTEXF_POINT.0 as u32),
+            (D3DSAMP_MIPFILTER, D3DTEXF_NONE.0 as u32),
+            (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP.0 as u32),
+            (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP.0 as u32),
+            (D3DSAMP_SRGBTEXTURE, 0),
+        ] {
+            dev.SetSamplerState(0, state, value)?;
+        }
+        for (state, value) in [
+            (D3DRS_ZENABLE, 0),
+            (D3DRS_ZWRITEENABLE, 0),
+            (D3DRS_CULLMODE, D3DCULL_NONE.0 as u32),
+            (D3DRS_ALPHABLENDENABLE, 0),
+            (D3DRS_ALPHATESTENABLE, 0),
+            (D3DRS_STENCILENABLE, 0),
+            (D3DRS_SCISSORTESTENABLE, 0),
+            (D3DRS_FOGENABLE, 0),
+            (D3DRS_COLORWRITEENABLE, 0xF),
+            (D3DRS_SRGBWRITEENABLE, 0),
+        ] {
+            dev.SetRenderState(state, value)?;
+        }
+        let (w, h) = (width as f32, height as f32);
+        #[rustfmt::skip]
+        let quad: [f32; 24] = [
+            -0.5,     -0.5,     0.0, 1.0, 0.0, 0.0,
+            w - 0.5,  -0.5,     0.0, 1.0, 1.0, 0.0,
+            -0.5,     h - 0.5,  0.0, 1.0, 0.0, 1.0,
+            w - 0.5,  h - 0.5,  0.0, 1.0, 1.0, 1.0,
+        ];
+        dev.BeginScene()?;
+        let drawn = dev.DrawPrimitiveUP(
+            D3DPT_TRIANGLESTRIP,
+            2,
+            quad.as_ptr().cast(),
+            (6 * std::mem::size_of::<f32>()) as u32,
+        );
+        crate::dx_hooks::end_scene_unhooked(dev);
+
+        // Put everything back before checking how it went.
+        dev.SetTexture(0, None)?;
+        if let Some(t) = &old_target {
+            dev.SetRenderTarget(0, t)?;
+        }
+        dev.SetDepthStencilSurface(old_depth.as_ref())?;
+        state.Apply()?;
+        drawn?;
+        Ok(())
     }
 }
 
@@ -1405,6 +1722,17 @@ mod tests {
     }
 
     #[test]
+    fn step_ids_round_trip() {
+        for step in [
+            Step { frame: 0, pass: Pass::Main },
+            Step { frame: 7, pass: Pass::NoSkater },
+            Step { frame: 123_456, pass: Pass::Main },
+        ] {
+            assert_eq!(step_of(step_id(step)), step);
+        }
+    }
+
+    #[test]
     fn matte_keeps_what_differs() {
         let image = [10, 10, 10, 255, 200, 50, 50, 255];
         let world = [12, 10, 10, 255, 20, 50, 50, 255];
@@ -1412,22 +1740,6 @@ mod tests {
         assert_eq!(m[3], 0);
         assert_eq!(m[7], 255);
         assert_eq!(&m[4..7], &[200, 50, 50]);
-    }
-
-    #[test]
-    fn preview_is_halved_until_small_enough() {
-        let (w, h) = (2600u32, 4u32);
-        let mut rgba = vec![0u8; (w * h * 4) as usize];
-        // The first 2x2 block: two white pixels, two black ones.
-        for (x, y) in [(0usize, 0usize), (1, 1)] {
-            let i = (y * w as usize + x) * 4;
-            rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
-        }
-        let (size, out) = shrink((w, h), rgba);
-        assert_eq!(size, (1300 / 2, 1));
-        assert_eq!(out.len(), 650 * 4);
-        // Halved twice: the 4x4 block holds 2 white pixels of 16.
-        assert_eq!(out[0], 127 / 4);
     }
 
     #[test]

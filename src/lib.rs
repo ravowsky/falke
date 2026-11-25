@@ -12,6 +12,7 @@ mod thaw_blend;
 mod thps4;
 mod thug2;
 mod ui;
+mod final_image;
 mod video;
 use std::ffi::c_void;
 

@@ -411,11 +411,6 @@ pub struct UiSystem {
     capture_error: Option<String>,
     /// Whether ffmpeg was found (checked when the Capture window first opens).
     ffmpeg: Option<bool>,
-    /// The pass to preview, and the preview shown (its generation, pass and texture).
-    preview_pass: video::PreviewPass,
-    preview: Option<(u64, video::PreviewPass, egui::TextureHandle)>,
-    /// Show the preview in a window of its own, larger.
-    preview_large: bool,
 }
 
 impl Default for UiSystem {
@@ -445,9 +440,6 @@ impl Default for UiSystem {
             capture: video::Settings::default(),
             capture_error: None,
             ffmpeg: None,
-            preview_pass: video::PreviewPass::Image,
-            preview: None,
-            preview_large: false,
         }
     }
 }
@@ -492,7 +484,11 @@ impl UiSystem {
                 self.playback.time = plan.time;
                 game::set_skater_hidden(plan.hide_skater);
             }
-            None => self.playback.advance(),
+            None => {
+                self.playback.advance();
+                video::set_view_settings(self.capture.depth_far, self.capture.matte_threshold);
+                game::set_skater_hidden(video::view_hides_skater());
+            }
         }
 
         if (self.playback.time - self.last_seen_time).abs() > f32::EPSILON {
@@ -1051,16 +1047,7 @@ impl UiSystem {
         if self.ffmpeg.is_none() {
             self.ffmpeg = Some(video::find_ffmpeg().is_some());
         }
-        let seen = self.preview.as_ref().map_or(0, |p| p.0);
-        if let Some(p) = video::take_preview(seen) {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [p.size.0 as usize, p.size.1 as usize],
-                &p.rgba,
-            );
-            let texture = ctx.load_texture("capture_preview", image, egui::TextureOptions::LINEAR);
-            self.preview = Some((p.generation, p.pass, texture));
-        }
-        let previewing = video::preview_running();
+
         egui::Window::new("Capture")
             .default_pos(egui::pos2(40.0, 120.0))
             .default_width(260.0)
@@ -1081,6 +1068,49 @@ impl UiSystem {
                                 ui.selectable_value(&mut c.format, f, f.label());
                             }
                         });
+                    let reshade = crate::final_image::connect();
+                    ui.horizontal(|ui| {
+                        ui.label("Image from");
+                        egui::ComboBox::from_id_salt("CaptureSource")
+                            .selected_text(if c.final_image { "Screen" } else { "Game" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut c.final_image, false, "Game")
+                                    .on_hover_text("The game's own image, before ReShade");
+                                ui.add_enabled_ui(reshade.is_ok(), |ui| {
+                                    ui.selectable_value(&mut c.final_image, true, "Screen")
+                                        .on_hover_text(
+                                            "What reaches the screen: after ReShade and its \
+                                             add-ons (DLSS, RenoDX, ...)",
+                                        );
+                                });
+                            });
+                    });
+                    if c.final_image {
+                        match &reshade {
+                            Ok(()) => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Settle");
+                                    ui.add(
+                                        DragValue::new(&mut c.settle)
+                                            .range(0..=16)
+                                            .suffix(" frames"),
+                                    )
+                                    .on_hover_text(
+                                        "Each frame is drawn this many more times, the world \
+                                         held still, before it is saved, so effects that run \
+                                         behind the game (DLSS, temporal AA) have caught up. \
+                                         Raise it if frames come out one step late.",
+                                    );
+                                });
+                                ui.label(
+                                    "The overlay hides while capturing: press End to stop.",
+                                );
+                            }
+                            Err(e) => {
+                                ui.colored_label(STALE_KEY_COLOR, e);
+                            }
+                        }
+                    }
                     if c.format.needs_ffmpeg() && self.ffmpeg == Some(false) {
                         ui.colored_label(
                             STALE_KEY_COLOR,
@@ -1182,43 +1212,28 @@ impl UiSystem {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("PreviewPass")
-                        .selected_text(self.preview_pass.label())
+                    ui.label("View in game");
+                    let mut view = video::view();
+                    egui::ComboBox::from_id_salt("PassView")
+                        .selected_text(view.label())
                         .width(70.0)
                         .show_ui(ui, |ui| {
-                            for p in video::PreviewPass::ALL {
-                                ui.selectable_value(&mut self.preview_pass, p, p.label());
+                            for v in video::View::ALL {
+                                ui.selectable_value(&mut view, v, v.label());
                             }
                         });
-                    let can_preview = !running && !previewing && has_content && game::in_freecam();
-                    if ui
-                        .add_enabled(can_preview, egui::Button::new("👁 Preview"))
-                        .on_hover_text("Draw this pass at the playhead (nothing is saved)")
-                        .clicked()
-                    {
-                        if let Err(e) =
-                            video::start_preview(c, self.playback.time, self.preview_pass)
-                        {
-                            self.capture_error = Some(format!("{e:#}"));
-                        }
+                    if view != video::view() {
+                        video::set_view(view);
                     }
-                    if self.preview.is_some() {
-                        ui.checkbox(&mut self.preview_large, "Large");
-                    }
-                });
-                if previewing {
-                    ui.label("Drawing the preview...");
-                }
-                if let Some(e) = video::preview_error() {
-                    ui.colored_label(STALE_KEY_COLOR, format!("Preview: {e}"));
-                }
-                if let Some((_, pass, texture)) = &self.preview {
-                    if !self.preview_large {
-                        let [w, h] = texture.size();
-                        let width = ui.available_width().min(260.0);
-                        ui.image((texture.id(), Vec2::new(width, width * h as f32 / w as f32)))
-                            .on_hover_text(pass.label());
-                    }
+                })
+                .response
+                .on_hover_text(
+                    "Show a capture pass in the game instead of the normal image. World and \
+                     Skater need the replay loaded; Skater compares every other frame, so \
+                     pause playback to check it.",
+                );
+                if let Some(e) = video::view_error() {
+                    ui.colored_label(STALE_KEY_COLOR, format!("View: {e}"));
                 }
                 ui.separator();
 
@@ -1259,31 +1274,6 @@ impl UiSystem {
                     }
                 }
             });
-    }
-
-    /// The pass preview in a window of its own.
-    pub fn update_preview_window(&mut self, ctx: &eguiContext) {
-        let Some((_, pass, texture)) = &self.preview else {
-            return;
-        };
-        if !self.preview_large {
-            return;
-        }
-        let screen = ctx.screen_rect();
-        let mut open = true;
-        egui::Window::new(format!("Preview: {}", pass.label()))
-            .id(Id::new("capture_preview_window"))
-            .open(&mut open)
-            .default_width(screen.width() * 0.5)
-            .resizable(true)
-            .show(ctx, |ui| {
-                let [w, h] = texture.size();
-                let width = ui.available_width();
-                ui.image((texture.id(), Vec2::new(width, width * h as f32 / w as f32)));
-            });
-        if !open {
-            self.preview_large = false;
-        }
     }
 
     pub fn update_keyframe_detail(&mut self, ctx: &eguiContext) {
@@ -1966,7 +1956,6 @@ pub fn ui_render_loop(ctx: &eguiContext, _i: &mut i32) {
         }
         if replay_available {
             ui.update_capture(ctx);
-            ui.update_preview_window(ctx);
         }
     }
 
