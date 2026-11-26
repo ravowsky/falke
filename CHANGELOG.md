@@ -18,6 +18,7 @@ Unreleased
   - The skater keeps its speed into a cut and curves into the new motion, instead of stalling at the cut
   - Motion and turns follow a smooth curve through the recorded frames instead of changing direction at every frame (visible as a judder in slow motion)
 - Landing fakie into a manual no longer spins the skater all the way round in playback: the game shows the landing frame with the skater turned the wrong way round for one frame, which is now turned back. Turns of more than 60° in one frame (flips, snaps) no longer count as a speed to carry on with when easing out an animation cut
+- Switching sides on a grind (grind shuffle) no longer spins the skater all the way round in playback: the game shows the new grind one frame early still facing the old way, which is now turned the right way, and a snap of about half a turn is always eased out the short way round
 - An animation cut right before a teleport (respawn, big snap) no longer jumps at the frame before it
 - Cars, pedestrians and other animated objects are synced to replay playback (THAW)
   - The 24 pedestrians and 24 other animated objects nearest to the skater are recorded
