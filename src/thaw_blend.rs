@@ -359,25 +359,40 @@ impl<'a> PoseCache<'a> {
     /// with the bones turned along with it on one side: landing fakie into a manual, the
     /// game shows the new animation for one frame with the skater's frame still the wrong
     /// way round, and turns it back the frame after. Played as recorded, the skater would
-    /// spin all the way round. Returns that frame turned the right way (the frame halfway
-    /// between its neighbours', the bones kept as they are relative to it).
+    /// spin all the way round. Switching sides on a grind does it the other way round: the
+    /// new animation one frame early in the old frame, the frame catching up half a turn
+    /// later. Returns that frame turned the right way (the bones kept as they are relative to
+    /// it).
     fn flipped(&mut self, i: usize) -> Option<WorldPose> {
         if i == 0 {
             return None;
         }
         let (a, b, c) = (self.raw(i - 1)?, self.raw(i)?, self.raw(i + 1)?);
         let turned = |x: &WorldPose, y: &WorldPose| turn_angle(&x.frame, &y.frame);
-        if turned(&a, &b) < FLIP_MIN || turned(&b, &c) < FLIP_MIN || turned(&a, &c) > TURN_MAX {
-            return None;
-        }
         // The bones turned with the frame (not back against it, as on an ordinary
         // switch/fakie landing): they hardly move relative to it on one side, but a lot in
         // the world.
         let along = |x: &WorldPose, y: &WorldPose| skater_step(x, y) < 0.5 * relative_step(x, y);
-        if !(along(&a, &b) || along(&b, &c)) {
+        let frame = if turned(&a, &b) >= FLIP_MIN
+            && turned(&b, &c) >= FLIP_MIN
+            && turned(&a, &c) <= TURN_MAX
+            && (along(&a, &b) || along(&b, &c))
+        {
+            // Turned away and back: the frame halfway between its neighbours'.
+            rot_slerp(&a.frame, &c.frame, 0.5)
+        } else if turned(&a, &b) < FLIP_MIN
+            && turned(&b, &c) >= FLIP_MIN
+            && along(&b, &c)
+            && skater_step(&a, &b) > CUT_MIN_STEP
+            && skater_step(&b, &c) < 0.5 * CUT_MIN_STEP
+        {
+            // The other way round (switching sides on a grind): the new animation shows a
+            // frame early, still in the old frame, and the frame catches up with it half a
+            // turn in the next frame. The new animation belongs to the next frame's.
+            c.frame
+        } else {
             return None;
-        }
-        let frame = rot_slerp(&a.frame, &c.frame, 0.5);
+        };
         let bones = (0..b.bones.len())
             .map(|k| {
                 let root = self.is_root(k);
@@ -664,6 +679,22 @@ fn rot_log(r: &[[f32; 3]; 3]) -> [f32; 3] {
     }
     let angle = 2.0 * s.atan2(w);
     v.map(|x| x / s * angle)
+}
+
+/// A turn `v` (as `rot_log` gives it, at most half a turn) to be faded out while the motion
+/// turns on by `ahead`: the same turn the other way round (a whole turn less) when that
+/// makes what is shown turn less in all (`ahead - v`).
+fn wound(v: [f32; 3], ahead: [f32; 3]) -> [f32; 3] {
+    let (axis, angle) = norm3(v);
+    if angle < 1e-4 {
+        return v;
+    }
+    let other: [f32; 3] = std::array::from_fn(|i| v[i] - axis[i] * std::f32::consts::TAU);
+    let total = |x: [f32; 3]| {
+        let d: [f32; 3] = std::array::from_fn(|i| ahead[i] - x[i]);
+        dot3(d, d)
+    };
+    if total(other) < total(v) { other } else { v }
 }
 
 fn rot_exp(v: [f32; 3]) -> [[f32; 3]; 3] {
@@ -997,9 +1028,24 @@ pub(crate) fn displayed(
             // the frame one recorded frame later).
             let frame_at_cut = mul_rows(&transpose3(&turn_new), &after.frame);
             let df = mul_rows(&before.frame, &transpose3(&frame_at_cut));
+            // Which way round the difference is faded: the way that keeps the whole turn,
+            // from what was shown at the cut to where the new motion is when the fade is
+            // over, under half a turn. A snap of about half a turn (switching sides on a
+            // grind) followed by the game turning the skater on further would otherwise be
+            // faded the long way round: a whole spin.
+            let mut ahead = rot_log(&turn_new);
+            let end = (c + 1 + CUT_FRAMES).min(last);
+            let mut prev_frame = after.frame;
+            for j in c + 2..=end {
+                let Some(p) = cache.get(j) else { break };
+                let step = rot_log(&mul_rows(&p.frame, &transpose3(&prev_frame)));
+                ahead = std::array::from_fn(|i| ahead[i] + step[i]);
+                prev_frame = p.frame;
+            }
+            let back = wound(rot_log(&df), ahead);
             let turn_old = mul_rows(&before.frame, &transpose3(&before_prev.frame));
             let d = mul_rows(
-                &mul_rows(&power(&turn_old, ease.g), &power(&df, ease.w)),
+                &mul_rows(&power(&turn_old, ease.g), &rot_exp(back.map(|x| x * ease.w))),
                 &power(&transpose3(&turn_new), ease.g),
             );
             out.frame = mul_rows(&d, &cur_frame);
