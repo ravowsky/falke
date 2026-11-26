@@ -373,23 +373,20 @@ impl<'a> PoseCache<'a> {
         // switch/fakie landing): they hardly move relative to it on one side, but a lot in
         // the world.
         let along = |x: &WorldPose, y: &WorldPose| skater_step(x, y) < 0.5 * relative_step(x, y);
-        let frame = if turned(&a, &b) >= FLIP_MIN
-            && turned(&b, &c) >= FLIP_MIN
-            && turned(&a, &c) <= TURN_MAX
+        let (away, back) = (turned(&a, &b), turned(&b, &c));
+        let frame = if away >= TURN_SNAP_MIN
+            && back >= TURN_SNAP_MIN
+            && turned(&a, &c) <= TURN_MAX.min(0.5 * away.min(back))
             && (along(&a, &b) || along(&b, &c))
         {
             // Turned away and back: the frame halfway between its neighbours'.
             rot_slerp(&a.frame, &c.frame, 0.5)
-        } else if turned(&a, &b) < FLIP_MIN
-            && turned(&b, &c) >= FLIP_MIN
-            && along(&b, &c)
-            && skater_step(&a, &b) > CUT_MIN_STEP
-            && skater_step(&b, &c) < 0.5 * CUT_MIN_STEP
-        {
-            // The other way round (switching sides on a grind): the new animation shows a
-            // frame early, still in the old frame, and the frame catches up with it half a
-            // turn in the next frame. The new animation belongs to the next frame's.
-            c.frame
+        } else if let Some(settled) = self.settled_frame(i) {
+            // The other way round (switching sides on a grind, landing into a manual): right
+            // after an animation cut the new animation shows a frame or two early, still in
+            // a frame the game then snaps round with it. It belongs to the frame it settles
+            // in.
+            settled
         } else {
             return None;
         };
@@ -405,6 +402,50 @@ impl<'a> PoseCache<'a> {
             frame,
             bones,
         })
+    }
+
+    /// Whether frame `j` snaps round on the way to frame `j + 1`, the pose turning with it.
+    fn snaps(&mut self, j: usize) -> Option<bool> {
+        let (x, y) = (self.raw(j)?, self.raw(j + 1)?);
+        Some(
+            turn_angle(&x.frame, &y.frame) >= TURN_SNAP_MIN
+                && skater_step(&x, &y) < 0.5 * relative_step(&x, &y)
+                && skater_step(&x, &y) < 0.5 * CUT_MIN_STEP,
+        )
+    }
+
+    /// The frame that frame `i` should have when it is one of up to `SETTLE_FRAMES` right
+    /// after an animation cut in which the game snaps the skater's frame round with the new
+    /// animation (the bones keep their pose relative to it): the first frame after them.
+    fn settled_frame(&mut self, i: usize) -> Option<[[f32; 3]; 3]> {
+        if i == 0 {
+            return None;
+        }
+        if !self.snaps(i)? {
+            return None;
+        }
+        // The cut into the new animation: at `i` or up to SETTLE_FRAMES - 1 frames before,
+        // with every frame since snapping round.
+        let mut k = i;
+        loop {
+            let (x, y) = (self.raw(k - 1)?, self.raw(k)?);
+            if skater_step(&x, &y) > CUT_MIN_STEP {
+                break;
+            }
+            if k == 1 || i - (k - 1) >= SETTLE_FRAMES || !self.snaps(k - 1)? {
+                return None;
+            }
+            k -= 1;
+        }
+        // Where it settles.
+        let mut m = i + 1;
+        while self.snaps(m)? {
+            m += 1;
+            if m - k > SETTLE_FRAMES {
+                return None;
+            }
+        }
+        Some(self.raw(m)?.frame)
     }
 
     /// A frame as it is played: a lone frame is replaced by the halfway point of its
@@ -466,7 +507,18 @@ impl<'a> PoseCache<'a> {
         let jump = |x: f32, before: f32, after: f32| {
             x > CUT_MIN_STEP && x > CUT_RATIO * before.max(after).max(2.0)
         };
-        s1.1 < TELEPORT && (jump(s1.0, s0.0, s2.0) || jump(s1.1, s0.1, s2.1))
+        // The whole skater snapping round (the game turns a spin on by 70 degrees in one
+        // frame between two tricks), short of a switch/fakie flip.
+        let mut turn = |a: usize, b: usize| -> Option<f32> {
+            Some(turn_angle(&self.get(a)?.frame, &self.get(b)?.frame))
+        };
+        let snapped = match (turn(c - 1, c), turn(c, c + 1), turn(c + 1, c + 2)) {
+            (Some(t0), Some(t1), Some(t2)) => {
+                t1 > TURN_SNAP_MIN && t1 < FLIP_MIN && t1 > CUT_RATIO * t0.max(t2).max(0.05)
+            }
+            _ => false,
+        };
+        s1.1 < TELEPORT && (jump(s1.0, s0.0, s2.0) || jump(s1.1, s0.1, s2.1) || snapped)
     }
 
     /// Bone `k` of a frame in the skater's own space (see `to_skater`).
@@ -562,6 +614,15 @@ pub(crate) fn pose_step(pa: &WorldPose, pb: &WorldPose) -> f32 {
 /// A turn of the skater's frame this large (radians, 100 degrees) between two frames is the
 /// game flipping it (switch/fakie), not the skater turning.
 const FLIP_MIN: f32 = 1.75;
+/// The skater turning at least this far (radians, 35 degrees) in one frame, and far more than
+/// in the frames around it, is a snap, eased out like a cut.
+const TURN_SNAP_MIN: f32 = 0.6;
+/// Frames right after a cut whose frame the game may still snap round (see
+/// `PoseCache::settled_frame`).
+const SETTLE_FRAMES: usize = 3;
+/// At such a flip, a cut is faded in the skater's own space only when the bones move less
+/// than this much relative to the frame as in the world.
+const FLIP_FADE_RATIO: f32 = 0.75;
 
 /// The angle (radians) between two rotations.
 pub(crate) fn turn_angle(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> f32 {
@@ -995,7 +1056,15 @@ pub(crate) fn displayed(
         // would swing the body round).
         let skater_fade = {
             let pc = cache.get(c)?;
-            skater_step(&pc, &after) < relative_step(&pc, &after)
+            // With the frame snapping half round at the cut, only when the skater clearly
+            // turned as a whole (switching sides on a grind); when the body turns only part
+            // of the way (fakie into a manual) the frame's half turn is no turn to fade.
+            let ratio = if turn_angle(&pc.frame, &after.frame) >= FLIP_MIN {
+                FLIP_FADE_RATIO
+            } else {
+                1.0
+            };
+            skater_step(&pc, &after) < ratio * relative_step(&pc, &after)
         };
         if skater_fade {
             // A flip of the skater's frame right before or after the cut is no speed to
