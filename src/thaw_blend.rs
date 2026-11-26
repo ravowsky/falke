@@ -195,7 +195,7 @@ pub(crate) fn blend_world(a: &[f32; 16], b: &[f32; 16], t: f32) -> ([[f32; 3]; 3
 #[derive(Clone, Copy)]
 pub(crate) struct WorldBone {
     pub(crate) rot: [[f32; 3]; 3],
-    pos: [f32; 3],
+    pub(crate) pos: [f32; 3],
     l: [f32; 6],
 }
 
@@ -203,10 +203,10 @@ pub(crate) struct WorldBone {
 /// world space. With a skeleton, the rotation of a bone that has a parent is kept relative to
 /// the parent instead (see `to_local`).
 pub(crate) struct WorldPose {
-    origin: [f32; 3],
+    pub(crate) origin: [f32; 3],
     /// The skater's world rotation (rows), what the bones are drawn relative to.
-    frame: [[f32; 3]; 3],
-    bones: Vec<WorldBone>,
+    pub(crate) frame: [[f32; 3]; 3],
+    pub(crate) bones: Vec<WorldBone>,
 }
 
 pub(crate) fn world_pose(f: &ReplayState) -> Option<WorldPose> {
@@ -355,13 +355,53 @@ impl<'a> PoseCache<'a> {
         s1 > CUT_MIN_STEP && s2 > CUT_MIN_STEP && s1.min(s2) > CUT_RATIO * s0.max(s3).max(2.0)
     }
 
+    /// A frame whose skater's frame is turned half round against both of its neighbours,
+    /// with the bones turned along with it on one side: landing fakie into a manual, the
+    /// game shows the new animation for one frame with the skater's frame still the wrong
+    /// way round, and turns it back the frame after. Played as recorded, the skater would
+    /// spin all the way round. Returns that frame turned the right way (the frame halfway
+    /// between its neighbours', the bones kept as they are relative to it).
+    fn flipped(&mut self, i: usize) -> Option<WorldPose> {
+        if i == 0 {
+            return None;
+        }
+        let (a, b, c) = (self.raw(i - 1)?, self.raw(i)?, self.raw(i + 1)?);
+        let turned = |x: &WorldPose, y: &WorldPose| turn_angle(&x.frame, &y.frame);
+        if turned(&a, &b) < FLIP_MIN || turned(&b, &c) < FLIP_MIN || turned(&a, &c) > TURN_MAX {
+            return None;
+        }
+        // The bones turned with the frame (not back against it, as on an ordinary
+        // switch/fakie landing): they hardly move relative to it on one side, but a lot in
+        // the world.
+        let along = |x: &WorldPose, y: &WorldPose| skater_step(x, y) < 0.5 * relative_step(x, y);
+        if !(along(&a, &b) || along(&b, &c)) {
+            return None;
+        }
+        let frame = rot_slerp(&a.frame, &c.frame, 0.5);
+        let bones = (0..b.bones.len())
+            .map(|k| {
+                let root = self.is_root(k);
+                let local = to_skater(&b.frame, b.origin, &b.bones[k], root);
+                from_skater(&frame, b.origin, &local, root)
+            })
+            .collect();
+        Some(WorldPose {
+            origin: b.origin,
+            frame,
+            bones,
+        })
+    }
+
     /// A frame as it is played: a lone frame is replaced by the halfway point of its
-    /// neighbours, so the cut runs straight from one animation to the other.
+    /// neighbours, so the cut runs straight from one animation to the other, and a frame
+    /// turned the wrong way round is turned back (see `flipped`).
     fn get(&mut self, i: usize) -> Option<std::rc::Rc<WorldPose>> {
         if let Some((_, p)) = self.poses.iter().find(|(k, _)| *k == i) {
             return p.clone();
         }
-        let p = if self.is_lone(i) {
+        let p = if let Some(p) = self.flipped(i) {
+            Some(std::rc::Rc::new(p))
+        } else if self.is_lone(i) {
             match (self.raw(i - 1), self.raw(i + 1)) {
                 (Some(a), Some(b)) => Some(std::rc::Rc::new(WorldPose {
                     origin: lerp3(a.origin, b.origin, 0.5),
@@ -504,6 +544,23 @@ pub(crate) fn pose_step(pa: &WorldPose, pb: &WorldPose) -> f32 {
     relative_step(pa, pb).min(skater_step(pa, pb))
 }
 
+/// A turn of the skater's frame this large (radians, 100 degrees) between two frames is the
+/// game flipping it (switch/fakie), not the skater turning.
+const FLIP_MIN: f32 = 1.75;
+
+/// The angle (radians) between two rotations.
+pub(crate) fn turn_angle(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> f32 {
+    let v = rot_log(&mul_rows(&transpose3(a), b));
+    dot3(v, v).sqrt()
+}
+
+/// A turn a frame as a speed to carry on with: a turn past `TURN_MAX` in one frame is a
+/// snap (the game flipping or cutting), not a speed, and counts as none.
+fn as_speed(r: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let v = rot_log(&r);
+    if dot3(v, v).sqrt() > TURN_MAX { IDENTITY3 } else { r }
+}
+
 pub(crate) fn smoothstep(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
@@ -512,7 +569,7 @@ pub(crate) fn smoothstep(x: f32) -> f32 {
 /// The new motion's first frame `ab`, run back to the cut (`tau` < 1 frames after it) at the
 /// speed it moves and turns to the frame after (`nb`).
 fn run_back(ab: &WorldBone, nb: &WorldBone, tau: f32) -> WorldBone {
-    let step = mul_rows(&transpose3(&ab.rot), &nb.rot);
+    let step = as_speed(mul_rows(&transpose3(&ab.rot), &nb.rot));
     WorldBone {
         rot: mul_rows(&ab.rot, &power(&transpose3(&step), 1.0 - tau)),
         pos: std::array::from_fn(|i| ab.pos[i] + (ab.pos[i] - nb.pos[i]) * (1.0 - tau)),
@@ -579,8 +636,8 @@ fn fade(
     // The rotation that takes the new motion (run back to the cut) to the old one, and each
     // motion's turn a frame.
     let d = mul_rows(&transpose3(&run_back(ab, nb, 0.0).rot), &before.rot);
-    let step_old = mul_rows(&transpose3(&before_prev.rot), &before.rot);
-    let step_new = mul_rows(&transpose3(&ab.rot), &nb.rot);
+    let step_old = as_speed(mul_rows(&transpose3(&before_prev.rot), &before.rot));
+    let step_new = as_speed(mul_rows(&transpose3(&ab.rot), &nb.rot));
     let dw = mul_rows(
         &mul_rows(&power(&transpose3(&step_new), ease.g), &power(&d, ease.w)),
         &power(&step_old, ease.g),
@@ -790,11 +847,12 @@ pub(crate) fn displayed(
     let frac = t - i0 as f32;
     let (a, b) = (cache.get(i0)?, cache.get(i1)?);
     let n = a.bones.len().min(b.bones.len());
-    // A teleport is shown as a cut, not as a flight across the map.
+    // A teleport is shown as a cut, not as a flight across the map. Up to it, frame `i0`
+    // is held, still easing out a cut before it (below).
     let o: [f32; 3] = std::array::from_fn(|i| a.origin[i] - b.origin[i]);
-    if dot3(o, o).sqrt() > TELEPORT {
-        let p = if frac < 0.5 { &a } else { &b };
-        return Some(shown_frame(cache, p));
+    let teleport = dot3(o, o).sqrt() > TELEPORT;
+    if teleport && frac >= 0.5 {
+        return Some(shown_frame(cache, &b));
     }
     // The frames before and after these two, to keep the motion's speed and turn going
     // smoothly through each recorded frame (instead of changing them at every frame, which
@@ -818,7 +876,7 @@ pub(crate) fn displayed(
     } else {
         None
     };
-    let curve = Curve::at(frac);
+    let curve = Curve::at(if teleport { 0.0 } else { frac });
 
     let frame = curve.frame(
         prev.as_ref().map(|p| &p.frame),
@@ -869,6 +927,14 @@ pub(crate) fn displayed(
         if tau >= (CUT_FRAMES + 1) as f32 {
             break;
         }
+        // Not across a teleport since the cut.
+        let jumped = (c + 1..i0).any(|j| match (cache.get(j), cache.get(j + 1)) {
+            (Some(p), Some(q)) => !near(&p, &q),
+            _ => true,
+        });
+        if jumped {
+            break;
+        }
         let ease = Ease::at(tau);
         // What was shown at the cut and one frame before it (themselves possibly still
         // fading an earlier cut): the old motion, and its speed.
@@ -901,6 +967,18 @@ pub(crate) fn displayed(
             skater_step(&pc, &after) < relative_step(&pc, &after)
         };
         if skater_fade {
+            // A flip of the skater's frame right before or after the cut is no speed to
+            // carry on with (in the skater's own space everything swaps sides).
+            let next = if turn_angle(&after.frame, &next.frame) > TURN_MAX {
+                after.clone()
+            } else {
+                next
+            };
+            let before_prev = if turn_angle(&before_prev.frame, &before.frame) > TURN_MAX {
+                before.clone()
+            } else {
+                before_prev
+            };
             // The skater's frame. Until the new animation's first frame is reached, it is
             // run backwards from there.
             let turn_new = mul_rows(&next.frame, &transpose3(&after.frame));
