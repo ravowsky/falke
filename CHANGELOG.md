@@ -22,7 +22,7 @@ Unreleased
 - Cars, pedestrians and other animated objects are synced to replay playback (THAW)
   - The 24 pedestrians and 24 other animated objects nearest to the skater are recorded
   - Cars that were not recorded are hidden during playback
-  - Only syncs for replays recorded in the current game session
+  - Syncs after restarting the game too: objects are recorded by their id (the checksum of their name, the same every time the level loads) and played on the live object with that id. A recorded object with no match (a pedestrian spawned differently, or a replay recorded before this) is played on the nearest free live object of the same kind and skeleton, which keeps it while the replay plays; it moves as recorded but may look different. Replays recorded before this still sync fully in the game session they were recorded in
 - Experimental: sync moving objects without a skeleton, such as cranes and crates (THAW), switched on in the Replay window
 - The game world stands still while a replay is paused in freecam (THAW)
 - Generic replay interpolation no longer blends across 180° flips and animation cuts (shows the nearer frame instead)
