@@ -415,6 +415,7 @@ dependencies = [
  "egui",
  "egui-d3d9",
  "egui_extras",
+ "flate2",
  "log",
  "nalgebra-glm",
  "png",

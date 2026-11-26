@@ -20,6 +20,7 @@ egui = "0.31.0"
 egui-d3d9 = { path = "egui-d3d9" }  # vendored from sourcethps/egui-d3d9 (feature/fix-alt-tab-crash), patched: see egui-d3d9/FALKE-PATCHES.md
 nalgebra-glm = "0.20.0"
 png = "0.17"
+flate2 = "1"
 toy-arms = {git = "https://github.com/vxcall/toy-arms"}
 
 [build-dependencies]
