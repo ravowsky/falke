@@ -17,6 +17,8 @@ Unreleased
   - Turning skaters (wallrides, spins) are blended relative to the skater, so the body swings round with the turn instead of cutting across it
   - The skater keeps its speed into a cut and curves into the new motion, instead of stalling at the cut
   - Motion and turns follow a smooth curve through the recorded frames instead of changing direction at every frame (visible as a judder in slow motion)
+- Landing fakie into a manual no longer spins the skater all the way round in playback: the game shows the landing frame with the skater turned the wrong way round for one frame, which is now turned back. Turns of more than 60° in one frame (flips, snaps) no longer count as a speed to carry on with when easing out an animation cut
+- An animation cut right before a teleport (respawn, big snap) no longer jumps at the frame before it
 - Cars, pedestrians and other animated objects are synced to replay playback (THAW)
   - The 24 pedestrians and 24 other animated objects nearest to the skater are recorded
   - Cars that were not recorded are hidden during playback
