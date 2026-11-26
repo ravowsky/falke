@@ -15,7 +15,9 @@ use crate::{
 /// precision.
 /// 5: like 4, plus each frame's time (f32 seconds since the recording started) after the
 /// camera. Versions 3 and 4 still load (their frames are 1/60 s apart).
-const FLK_REPLAY_VERSION: u8 = 5;
+/// 6: the same frames, compressed in blocks (see `blocks`): about a fifth of the size,
+/// nothing lost.
+const FLK_REPLAY_VERSION: u8 = 6;
 /// The frame rate replays without recorded times are played at.
 pub const FRAME_RATE: f32 = 60.0;
 /// A frame identical to the one before is not written (the game did not move on, e.g. the
@@ -29,7 +31,7 @@ pub const MAX_BONES: usize = 55;
 
 pub struct Replay {
     file_path: PathBuf,
-    writer: Option<BufWriter<std::fs::File>>,
+    writer: Option<BlockWriter>,
     frame_count: u64,
     /// When the first frame was written.
     started: Option<Instant>,
@@ -96,7 +98,7 @@ impl Replay {
         writer.write_all(&[FLK_REPLAY_VERSION])?;
         // Placeholder: frame count will be written in finish().
         writer.write_all(&0u64.to_le_bytes())?;
-        self.writer = Some(writer);
+        self.writer = Some(BlockWriter::start(writer));
         Ok(())
     }
 
@@ -121,43 +123,7 @@ impl Replay {
             }
         }
         let writer = self.writer.as_mut().context("replay writer not open")?;
-
-        writer.write_all(&[state.skaters.len() as u8])?;
-        for skater in &state.skaters {
-            // Only the bones this skeleton has: the arrays are sized for the
-            // largest game, not for the one being recorded.
-            let bones = skater.bones();
-            let half = skater.compact();
-            writer.write_all(&[bones as u8 | if half { HALF_FLAG } else { 0 }])?;
-            write_f32s(writer, &skater.world_pos)?;
-            write_f32s(writer, &skater.world_matrix)?;
-            let write = |w: &mut BufWriter<std::fs::File>, v: &[f32]| {
-                if half {
-                    write_f16s(w, v)
-                } else {
-                    write_f32s(w, v)
-                }
-            };
-            for quat in &skater.bone_quats[..bones] {
-                write(writer, quat)?;
-            }
-            for trans in &skater.bone_trans[..bones] {
-                write(writer, trans)?;
-            }
-        }
-        // Camera: a presence byte, then the pose. A frame recorded before the
-        // camera was found genuinely has none, so it is not worth a pose of
-        // zeros that reads back as a valid (and wrong) orientation.
-        match &state.camera {
-            Some(cam) => {
-                writer.write_all(&[1])?;
-                write_f32s(writer, &cam.position.to_array())?;
-                write_f32s(writer, &cam.orientation.to_array())?;
-                write_f32s(writer, &[cam.fov])?;
-            }
-            None => writer.write_all(&[0])?,
-        }
-        write_f32s(writer, &[time])?;
+        writer.push(state, time)?;
         self.frame_count += 1;
         self.last = Some((time, state.clone()));
         Ok(())
@@ -166,9 +132,7 @@ impl Replay {
     /// Flushes the writer and patches the frame count into the file header.
     pub fn finish(&mut self) -> Result<()> {
         if let Some(writer) = self.writer.take() {
-            let mut file = writer
-                .into_inner()
-                .map_err(|e| anyhow::anyhow!("flush failed: {}", e.error()))?;
+            let mut file = writer.finish()?;
             file.seek(SeekFrom::Start(1))?;
             file.write_all(&self.frame_count.to_le_bytes())?;
             log::info!(
@@ -182,6 +146,67 @@ impl Replay {
 
     pub fn frame_count(&self) -> u64 {
         self.frame_count
+    }
+}
+
+/// Packs and writes the blocks of a recording on its own thread, so the game does not wait
+/// for the compression.
+struct BlockWriter {
+    encoder: blocks::Encoder,
+    tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    thread: Option<std::thread::JoinHandle<Result<std::fs::File>>>,
+}
+
+impl BlockWriter {
+    fn start(mut out: BufWriter<std::fs::File>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let thread = std::thread::Builder::new()
+            .name("falke replay writer".into())
+            .spawn(move || -> Result<std::fs::File> {
+                for raw in rx {
+                    out.write_all(&blocks::pack(&raw)?)?;
+                    // Each whole block reaches the disk, so a crash loses at most one.
+                    out.flush()?;
+                }
+                out.into_inner()
+                    .map_err(|e| anyhow::anyhow!("flush failed: {}", e.error()))
+            })
+            .ok();
+        Self {
+            encoder: blocks::Encoder::default(),
+            tx: Some(tx),
+            thread,
+        }
+    }
+
+    fn push(&mut self, state: &ReplayState, time: f32) -> Result<()> {
+        self.encoder.push(state, time);
+        if self.encoder.frames >= blocks::BLOCK_FRAMES {
+            self.send()?;
+        }
+        Ok(())
+    }
+
+    fn send(&mut self) -> Result<()> {
+        if self.encoder.frames == 0 {
+            return Ok(());
+        }
+        let raw = self.encoder.take();
+        self.tx
+            .as_ref()
+            .context("replay writer closed")?
+            .send(raw)
+            .map_err(|_| anyhow::anyhow!("replay writer stopped"))
+    }
+
+    fn finish(mut self) -> Result<std::fs::File> {
+        self.send()?;
+        drop(self.tx.take());
+        self.thread
+            .take()
+            .context("replay writer thread did not start")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("replay writer thread panicked"))?
     }
 }
 
@@ -215,8 +240,17 @@ impl LoadedReplay {
         let frame_count = u64::from_le_bytes(frame_count_bytes);
 
         let mut frames = Vec::with_capacity(frame_count as usize);
+        if version >= 6 {
+            frames = blocks::read_all(&mut file)?;
+            if frames.len() as u64 != frame_count {
+                log::warn!(
+                    "replay header says {frame_count} frames, the file holds {} (recording cut short?)",
+                    frames.len()
+                );
+            }
+        }
 
-        for _ in 0..frame_count {
+        for _ in 0..if version >= 6 { 0 } else { frame_count } {
             let mut skater_count = [0u8; 1];
             file.read_exact(&mut skater_count)?;
             let skater_count = skater_count[0] as usize;
@@ -307,7 +341,7 @@ impl LoadedReplay {
 
         Ok(Self {
             name: name.to_owned(),
-            frame_count,
+            frame_count: frames.len() as u64,
             frames,
         })
     }
@@ -549,20 +583,6 @@ fn slerp_quat(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     Quat::from(r).to_array()
 }
 
-fn write_f32s(w: &mut impl Write, values: &[f32]) -> Result<()> {
-    for v in values {
-        w.write_all(&v.to_le_bytes())?;
-    }
-    Ok(())
-}
-
-fn write_f16s(w: &mut impl Write, values: &[f32]) -> Result<()> {
-    for v in values {
-        w.write_all(&f32_to_f16(*v).to_le_bytes())?;
-    }
-    Ok(())
-}
-
 fn read_f16s<const N: usize>(r: &mut impl Read) -> Result<[f32; N]> {
     let mut out = [0f32; N];
     for v in out.iter_mut() {
@@ -640,6 +660,71 @@ fn read_f32s<const N: usize>(r: &mut impl Read) -> Result<[f32; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocks_round_trip_exactly() {
+        let mut frames = Vec::new();
+        for i in 0..150 {
+            let x = i as f32 * 0.37;
+            let mut skater = SkaterState {
+                world_pos: [x, 1.5, -x * 2.0],
+                world_matrix: std::array::from_fn(|k| (k as f32 + x).sin()),
+                bone_count: 3,
+                bone_quats: [[0.0, 0.0, 0.0, 1.0]; MAX_BONES],
+                bone_trans: [[0f32; 4]; MAX_BONES],
+            };
+            for b in 0..3 {
+                skater.bone_quats[b] = [x.sin() * 0.5, 0.1, b as f32 * 0.2, 0.8];
+                skater.bone_trans[b] = [x, b as f32, -x, 0.0];
+            }
+            // An entry with only identity rotations, and one more on some frames.
+            let mut part = skater.clone();
+            part.bone_quats = [[0.0, 0.0, 0.0, 1.0]; MAX_BONES];
+            let mut skaters = vec![skater, part];
+            if i % 7 < 3 {
+                let mut car = skaters[0].clone();
+                car.world_matrix[3] = 4250.0;
+                skaters.push(car);
+            }
+            frames.push(ReplayState {
+                skaters,
+                camera: (i % 11 != 0).then(|| CameraPose {
+                    position: Vec3::from_array([x, 2.0, 3.0]),
+                    orientation: Quat::from_array([0.0, 0.0, 0.0, 1.0]),
+                    fov: 72.0,
+                }),
+                time: x,
+            });
+        }
+        let mut file = Vec::new();
+        let mut enc = blocks::Encoder::default();
+        for f in &frames {
+            enc.push(f, f.time);
+            if enc.frames >= blocks::BLOCK_FRAMES {
+                file.extend(blocks::pack(&enc.take()).unwrap());
+            }
+        }
+        file.extend(blocks::pack(&enc.take()).unwrap());
+        let back = blocks::read_all(&mut &file[..]).unwrap();
+        assert_eq!(back.len(), frames.len());
+        for (a, b) in frames.iter().zip(&back) {
+            assert_eq!(a.time.to_bits(), b.time.to_bits());
+            assert_eq!(a.camera, b.camera);
+            assert_eq!(a.skaters.len(), b.skaters.len());
+            for (x, y) in a.skaters.iter().zip(&b.skaters) {
+                assert_eq!(x.world_pos, y.world_pos);
+                assert_eq!(x.world_matrix, y.world_matrix);
+                assert_eq!(x.bone_count, y.bone_count);
+                // Traffic is kept at half precision (as before); the rest exactly.
+                if !x.compact() {
+                    for k in 0..x.bones() {
+                        assert_eq!(x.bone_trans[k], y.bone_trans[k]);
+                        assert_eq!(x.bone_quats[k], y.bone_quats[k]);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn half_precision_round_trip() {
@@ -738,5 +823,361 @@ mod tests {
         // No writer open: an empty frame must bail out before touching it.
         replay.write_frame(&ReplayState::default()).unwrap();
         assert_eq!(replay.frame_count(), 0);
+    }
+}
+
+// Version 6: frames in compressed blocks.
+//
+// A frame is split into its layout (counts and flags: the `meta` bytes) and its numbers,
+// which are kept as raw bit patterns (lossless). Every number is stored XORed with the same
+// number of the frame before (the same entry, if that entry has the same layout), so that a
+// value that barely moves leaves mostly zero bits; the numbers are then laid out byte plane
+// by byte plane (every first byte, then every second byte...) so those zeros line up, and
+// the block is deflated. A block holds up to BLOCK_FRAMES frames and starts afresh (no
+// reference to the block before), so a file cut short (the game crashed while recording)
+// still loads up to its last whole block. Bone rotations that are all identity (the
+// skater's extra pose entries) are not stored at all (NO_QUATS_FLAG).
+mod blocks {
+    use super::*;
+    use anyhow::Context as _;
+
+    pub(super) const NO_QUATS_FLAG: u8 = 0x40;
+    pub(super) const BONES_MASK: u8 = 0x3f;
+    /// Frames in one compressed block (about a second).
+    pub(super) const BLOCK_FRAMES: usize = 60;
+    const IDENTITY: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    /// The numbers of one entry, as bit patterns.
+    #[derive(Default, Clone)]
+    struct Words {
+        w32: Vec<u32>,
+        w16: Vec<u16>,
+    }
+
+    /// What the numbers of a frame are predicted from: the two frames before.
+    #[derive(Default)]
+    struct Context {
+        entries: Vec<(u8, Words)>,
+        older: Vec<(u8, Words)>,
+        camera: Option<[u32; 8]>,
+        older_camera: Option<[u32; 8]>,
+        time: u32,
+        older_time: Option<u32>,
+    }
+
+    /// The prediction for a number: carried on from the two frames before (`2 * a - b`, as
+    /// floats; the same sum on both sides, so the decoder gets the very same bits), or the
+    /// frame before if only that one is known.
+    fn predict(a: u32, b: Option<u32>) -> u32 {
+        match b {
+            Some(b) => {
+                let p = 2.0 * f32::from_bits(a) - f32::from_bits(b);
+                if p.is_finite() { p.to_bits() } else { a }
+            }
+            None => a,
+        }
+    }
+
+    /// The entry `i` of the frame before (and the one before that), if it has this layout.
+    fn reference<'a>(
+        ctx: &'a Context,
+        i: usize,
+        header: u8,
+        len32: usize,
+        len16: usize,
+    ) -> Option<(&'a Words, Option<&'a Words>)> {
+        let fits = |e: &&(u8, Words)| e.0 == header && e.1.w32.len() == len32 && e.1.w16.len() == len16;
+        let prev = ctx.entries.get(i).filter(fits)?;
+        Some((&prev.1, ctx.older.get(i).filter(fits).map(|e| &e.1)))
+    }
+
+    fn header_of(s: &SkaterState) -> u8 {
+        let bones = s.bones() as u8;
+        let mut h = bones & BONES_MASK;
+        if s.compact() {
+            h |= HALF_FLAG;
+        }
+        if s.bone_quats[..s.bones()].iter().all(|q| *q == IDENTITY) {
+            h |= NO_QUATS_FLAG;
+        }
+        h
+    }
+
+    fn words_of(s: &SkaterState, header: u8) -> Words {
+        let half = header & HALF_FLAG != 0;
+        let mut w = Words::default();
+        w.w32.extend(s.world_pos.iter().map(|v| v.to_bits()));
+        w.w32.extend(s.world_matrix.iter().map(|v| v.to_bits()));
+        let n = s.bones();
+        let mut put = |v: &[f32]| {
+            if half {
+                w.w16.extend(v.iter().map(|x| f32_to_f16(*x)));
+            } else {
+                w.w32.extend(v.iter().map(|x| x.to_bits()));
+            }
+        };
+        if header & NO_QUATS_FLAG == 0 {
+            for q in &s.bone_quats[..n] {
+                put(q);
+            }
+        }
+        for t in &s.bone_trans[..n] {
+            put(t);
+        }
+        w
+    }
+
+    fn camera_prediction(ctx: &Context) -> [u32; 8] {
+        match ctx.camera {
+            Some(c) => std::array::from_fn(|k| predict(c[k], ctx.older_camera.map(|o| o[k]))),
+            None => [0; 8],
+        }
+    }
+
+    /// Collects frames and turns them into blocks.
+    #[derive(Default)]
+    pub(super) struct Encoder {
+        meta: Vec<u8>,
+        w32: Vec<u32>,
+        w16: Vec<u16>,
+        pub(super) frames: usize,
+        ctx: Context,
+    }
+
+    impl Encoder {
+        pub(super) fn push(&mut self, state: &ReplayState, time: f32) {
+            self.meta.push(state.skaters.len() as u8);
+            let mut entries = Vec::with_capacity(state.skaters.len());
+            for (i, s) in state.skaters.iter().enumerate() {
+                let header = header_of(s);
+                self.meta.push(header);
+                let words = words_of(s, header);
+                match reference(&self.ctx, i, header, words.w32.len(), words.w16.len()) {
+                    Some((p, older)) => {
+                        self.w32.extend(words.w32.iter().enumerate().map(|(k, a)| {
+                            a ^ predict(p.w32[k], older.map(|o| o.w32[k]))
+                        }));
+                        self.w16.extend(words.w16.iter().zip(&p.w16).map(|(a, b)| a ^ b));
+                    }
+                    None => {
+                        self.w32.extend(&words.w32);
+                        self.w16.extend(&words.w16);
+                    }
+                }
+                entries.push((header, words));
+            }
+            self.ctx.older = std::mem::replace(&mut self.ctx.entries, entries);
+            match &state.camera {
+                Some(cam) => {
+                    self.meta.push(1);
+                    let mut c = [0u32; 8];
+                    for (k, v) in cam
+                        .position
+                        .to_array()
+                        .iter()
+                        .chain(cam.orientation.to_array().iter())
+                        .chain(std::iter::once(&cam.fov))
+                        .enumerate()
+                    {
+                        c[k] = v.to_bits();
+                    }
+                    let pred = camera_prediction(&self.ctx);
+                    self.w32.extend(c.iter().zip(pred).map(|(a, b)| a ^ b));
+                    self.ctx.older_camera = self.ctx.camera.replace(c);
+                }
+                None => {
+                    self.meta.push(0);
+                    self.ctx.older_camera = self.ctx.camera.take();
+                }
+            }
+            let t = time.to_bits();
+            self.w32.push(t ^ predict(self.ctx.time, self.ctx.older_time));
+            self.ctx.older_time = Some(self.ctx.time);
+            self.ctx.time = t;
+            self.frames += 1;
+        }
+
+        /// The block so far, uncompressed, and a fresh start.
+        pub(super) fn take(&mut self) -> Vec<u8> {
+            let e = std::mem::take(self);
+            let mut out = Vec::with_capacity(16 + e.meta.len() + e.w32.len() * 4 + e.w16.len() * 2);
+            for n in [e.frames, e.meta.len(), e.w32.len(), e.w16.len()] {
+                out.extend_from_slice(&(n as u32).to_le_bytes());
+            }
+            out.extend_from_slice(&e.meta);
+            for plane in 0..4 {
+                out.extend(e.w32.iter().map(|w| (w >> (plane * 8)) as u8));
+            }
+            for plane in 0..2 {
+                out.extend(e.w16.iter().map(|w| (w >> (plane * 8)) as u8));
+            }
+            out
+        }
+    }
+
+    /// Compresses a block: its raw length, compressed length, then the deflated bytes.
+    pub(super) fn pack(raw: &[u8]) -> Result<Vec<u8>> {
+        use flate2::{Compression, write::DeflateEncoder};
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
+        enc.write_all(raw)?;
+        let data = enc.finish()?;
+        let mut out = Vec::with_capacity(8 + data.len());
+        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        Ok(out)
+    }
+
+    /// Reads blocks until the end of the file (or a block cut short).
+    pub(super) fn read_all(file: &mut impl Read) -> Result<Vec<ReplayState>> {
+        let mut frames = Vec::new();
+        loop {
+            let mut head = [0u8; 8];
+            match file.read_exact(&mut head) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+            let raw_len = u32::from_le_bytes(head[..4].try_into().unwrap()) as usize;
+            let comp_len = u32::from_le_bytes(head[4..].try_into().unwrap()) as usize;
+            let mut data = vec![0u8; comp_len];
+            if file.read_exact(&mut data).is_err() {
+                log::warn!("replay ends in the middle of a block (recording cut short?)");
+                break;
+            }
+            let mut raw = Vec::with_capacity(raw_len);
+            flate2::read::DeflateDecoder::new(&data[..])
+                .read_to_end(&mut raw)
+                .context("damaged replay block")?;
+            decode(&raw, &mut frames).context("damaged replay block")?;
+        }
+        Ok(frames)
+    }
+
+    fn decode(raw: &[u8], frames: &mut Vec<ReplayState>) -> Result<()> {
+        let u32_at = |i: usize| -> Result<usize> {
+            Ok(u32::from_le_bytes(raw.get(i..i + 4).context("short block")?.try_into()?) as usize)
+        };
+        let (count, meta_len, n32, n16) = (u32_at(0)?, u32_at(4)?, u32_at(8)?, u32_at(12)?);
+        let meta = raw.get(16..16 + meta_len).context("short block")?;
+        let p32 = 16 + meta_len;
+        let p16 = p32 + n32 * 4;
+        if raw.len() < p16 + n16 * 2 {
+            anyhow::bail!("short block");
+        }
+        let w32 = |k: usize| -> u32 {
+            (0..4).fold(0u32, |acc, plane| acc | (raw[p32 + plane * n32 + k] as u32) << (plane * 8))
+        };
+        let w16 = |k: usize| -> u16 {
+            (0..2).fold(0u16, |acc, plane| acc | (raw[p16 + plane * n16 + k] as u16) << (plane * 8))
+        };
+        let (mut m, mut i32_, mut i16_) = (0usize, 0usize, 0usize);
+        let mut next_meta = || -> Result<u8> {
+            let v = *meta.get(m).context("short block")?;
+            m += 1;
+            Ok(v)
+        };
+        let mut ctx = Context::default();
+        for _ in 0..count {
+            let skater_count = next_meta()? as usize;
+            let mut skaters = Vec::with_capacity(skater_count);
+            let mut entries = Vec::with_capacity(skater_count);
+            for e in 0..skater_count {
+                let header = next_meta()?;
+                let bones = (header & BONES_MASK) as usize;
+                if bones > MAX_BONES {
+                    anyhow::bail!("replay wants {bones} bones per skater, more than {MAX_BONES}");
+                }
+                let half = header & HALF_FLAG != 0;
+                let quats = header & NO_QUATS_FLAG == 0;
+                let per_bone = if quats { 8 } else { 4 };
+                let (len32, len16) = if half {
+                    (19, bones * per_bone)
+                } else {
+                    (19 + bones * per_bone, 0)
+                };
+                if i32_ + len32 > n32 || i16_ + len16 > n16 {
+                    anyhow::bail!("short block");
+                }
+                let mut words = Words {
+                    w32: (0..len32).map(|k| w32(i32_ + k)).collect(),
+                    w16: (0..len16).map(|k| w16(i16_ + k)).collect(),
+                };
+                i32_ += len32;
+                i16_ += len16;
+                if let Some((p, older)) = reference(&ctx, e, header, len32, len16) {
+                    for (k, a) in words.w32.iter_mut().enumerate() {
+                        *a ^= predict(p.w32[k], older.map(|o| o.w32[k]));
+                    }
+                    words.w16.iter_mut().zip(&p.w16).for_each(|(a, b)| *a ^= b);
+                }
+                let f = |k: usize| f32::from_bits(words.w32[k]);
+                let mut s = SkaterState {
+                    world_pos: std::array::from_fn(|k| f(k)),
+                    world_matrix: std::array::from_fn(|k| f(3 + k)),
+                    bone_count: bones as u8,
+                    bone_quats: [IDENTITY; MAX_BONES],
+                    bone_trans: [[0f32; 4]; MAX_BONES],
+                };
+                let value = |k: usize| -> f32 {
+                    if half {
+                        f16_to_f32(words.w16[k])
+                    } else {
+                        f(19 + k)
+                    }
+                };
+                let mut k = 0;
+                if quats {
+                    for q in s.bone_quats[..bones].iter_mut() {
+                        let v: [f32; 4] = std::array::from_fn(|c| value(k + c));
+                        k += 4;
+                        *q = if half {
+                            let len = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            if len > 0.0 { v.map(|x| x / len) } else { IDENTITY }
+                        } else {
+                            v
+                        };
+                    }
+                }
+                for t in s.bone_trans[..bones].iter_mut() {
+                    *t = std::array::from_fn(|c| value(k + c));
+                    k += 4;
+                }
+                skaters.push(s);
+                entries.push((header, words));
+            }
+            ctx.older = std::mem::replace(&mut ctx.entries, entries);
+            let camera = if next_meta()? != 0 {
+                if i32_ + 8 > n32 {
+                    anyhow::bail!("short block");
+                }
+                let pred = camera_prediction(&ctx);
+                let c: [u32; 8] = std::array::from_fn(|k| w32(i32_ + k) ^ pred[k]);
+                i32_ += 8;
+                ctx.older_camera = ctx.camera.replace(c);
+                let f = |k: usize| f32::from_bits(c[k]);
+                Some(CameraPose {
+                    position: Vec3::from_array([f(0), f(1), f(2)]),
+                    orientation: Quat::from_array([f(3), f(4), f(5), f(6)]),
+                    fov: f(7),
+                })
+            } else {
+                ctx.older_camera = ctx.camera.take();
+                None
+            };
+            if i32_ >= n32 {
+                anyhow::bail!("short block");
+            }
+            let t = w32(i32_) ^ predict(ctx.time, ctx.older_time);
+            i32_ += 1;
+            ctx.older_time = Some(ctx.time);
+            ctx.time = t;
+            frames.push(ReplayState {
+                skaters,
+                camera,
+                time: f32::from_bits(t),
+            });
+        }
+        Ok(())
     }
 }
