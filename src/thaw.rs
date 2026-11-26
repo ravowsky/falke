@@ -43,7 +43,7 @@ use std::{
     mem::transmute,
     sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -551,35 +551,56 @@ fn commit_skater(pose_addr: usize, pos: &[f32; 3], matrix: &[f32; 16], part_worl
 // not recorded (too far away then) keep walking.
 //
 // These entries come after the skater's pose and part entries. They have bones, and their
-// world matrix carries a marker and the object's key (its address, so only within the game
-// session it was recorded in) in the otherwise unused fourth column. Throughout this section
-// "car" means either kind.
+// world matrix carries a marker and the object's key in the otherwise unused fourth column.
+// The key is the object's id (the checksum of its name, the same every time the level loads),
+// and the marker says it is an id and what kind of object it is. Replays from before ids
+// were recorded carry the object's address instead (CAR_MARK), which only means something
+// in the game session it was recorded in. A recorded object is played on the live object
+// with its id (or address); one without a match (another session, a pedestrian spawned
+// differently) is played on the nearest live object of the same kind and skeleton that has
+// nothing else to play, and keeps it for as long as the replay plays. Throughout this
+// section "car" means either kind.
 
 const TYPE_CAR: u32 = 0x5c0312eb;
 const TYPE_PEDESTRIAN: u32 = 0xd2db7f97;
 const MAX_CAR_BONES: usize = 16;
 /// Pedestrians recorded per frame (the nearest to the skater); each is about 1.8 KB a frame.
 const MAX_PEDESTRIANS: usize = 24;
+/// Keyed by address (replays from before ids were recorded).
 const CAR_MARK: f32 = 4242.0;
+/// Keyed by object id: a car, a pedestrian, anything else.
+const CAR_ID_MARKS: [(f32, Kind); 3] = [
+    (4250.0, Kind::Car),
+    (4251.0, Kind::Pedestrian),
+    (4252.0, Kind::Other),
+];
+/// The object's id (its name's checksum), right before its type.
+const OBJ_ID: usize = 0x1C;
+const NO_ID: u32 = 0xFFFF_FFFF;
 /// Cars not in the recording are moved this far down while a replay plays.
 const HIDE_DEPTH: f32 = 100_000.0;
 
 /// One recorded car, ready to be drawn.
 #[derive(Clone)]
 struct CarFrame {
-    key: u32,
     pos: [f32; 3],
     rows: [[f32; 3]; 3],
     bones: Vec<[f32; 16]>,
 }
 
-/// The cars of the frame being played, and the live cars' pose buffers.
-static PLAYED_CARS: Mutex<Option<(Instant, Vec<CarFrame>)>> = Mutex::new(None);
-/// Live pose buffers: (buffer, key, is a pedestrian).
-static CAR_BUFFERS: Mutex<Vec<(usize, u32, Kind)>> = Mutex::new(Vec::new());
+/// What the commit hook draws: the cars of the frame being played, and for each live car's
+/// pose buffer, which of them it is drawn as (none: a car is hidden, anything else left
+/// alone).
+struct Played {
+    stamp: Instant,
+    cars: Vec<CarFrame>,
+    buffers: Vec<(usize, Option<usize>, Kind)>,
+}
+
+static PLAYED_CARS: Mutex<Option<Played>> = Mutex::new(None);
 
 /// What a recorded object with a skeleton is.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Car,
     Pedestrian,
@@ -694,7 +715,8 @@ fn car_pose_buffer(obj: usize) -> Option<(usize, usize)> {
     (bones >= 1).then_some((addr, bones))
 }
 
-/// The key a car is recognised by during playback (its object, same game session).
+/// The key a car is recognised by during playback in the same game session (its object).
+/// Also what moving objects are keyed by.
 fn car_key(obj: usize) -> u32 {
     obj as u32
 }
@@ -703,14 +725,88 @@ fn key_floats(key: u32) -> (f32, f32) {
     ((key >> 16) as f32, (key & 0xffff) as f32)
 }
 
-fn key_of(m: &[f32; 16]) -> Option<u32> {
-    (m[3] == CAR_MARK).then(|| ((m[7] as u32) << 16) | (m[11] as u32 & 0xffff))
+/// How a recorded car is recognised.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CarKey {
+    /// Its object id, and what it is.
+    Id(u32, Kind),
+    /// Its address (replays from before ids were recorded).
+    Address(u32),
+}
+
+fn key_of(m: &[f32; 16]) -> Option<CarKey> {
+    let value = ((m[7] as u32) << 16) | (m[11] as u32 & 0xffff);
+    if m[3] == CAR_MARK {
+        return Some(CarKey::Address(value));
+    }
+    CAR_ID_MARKS
+        .iter()
+        .find(|(mark, _)| m[3] == *mark)
+        .map(|(_, kind)| CarKey::Id(value, *kind))
+}
+
+/// Whether the objects' ids can be told apart (the id field is where it is thought to be):
+/// worked out once from the first frame with at least a few cars.
+static IDS_CHECKED: AtomicU8 = AtomicU8::new(0);
+const IDS_UNKNOWN: u8 = 0;
+const IDS_OK: u8 = 1;
+const IDS_BAD: u8 = 2;
+
+fn object_id(obj: usize) -> Option<u32> {
+    if IDS_CHECKED.load(Ordering::Relaxed) != IDS_OK {
+        return None;
+    }
+    read::<u32>(obj + OBJ_ID).filter(|id| *id != NO_ID)
+}
+
+/// Checks the id field on the live objects: every object with one has its own.
+fn check_ids(objects: &[usize]) {
+    if IDS_CHECKED.load(Ordering::Relaxed) != IDS_UNKNOWN || objects.len() < 4 {
+        return;
+    }
+    let ids: Vec<u32> = objects
+        .iter()
+        .filter_map(|o| read::<u32>(o + OBJ_ID))
+        .filter(|id| *id != NO_ID)
+        .collect();
+    // Checksums are spread over all 32 bits; a pointer to something of the object's own
+    // would lie near it.
+    let near_objects = objects
+        .iter()
+        .filter(|o| {
+            read::<u32>(*o + OBJ_ID).is_some_and(|id| (id as usize).abs_diff(**o) < 0x0100_0000)
+        })
+        .count();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let skater = skater_object().and_then(|o| read::<u32>(o + OBJ_ID));
+    let ok = ids.len() >= objects.len() / 2
+        && sorted.len() == ids.len()
+        && near_objects * 4 <= objects.len();
+    IDS_CHECKED.store(if ok { IDS_OK } else { IDS_BAD }, Ordering::Relaxed);
+    if ok {
+        log::info!(
+            "[THAW] traffic is recorded by object id ({} of {} objects have one; the skater's is {skater:08x?})",
+            ids.len(),
+            objects.len()
+        );
+    } else {
+        log::warn!(
+            "[THAW] object ids don't look right ({} of {} objects, {} different); traffic is recorded by address and only syncs in the same game session",
+            ids.len(),
+            objects.len(),
+            sorted.len()
+        );
+    }
 }
 
 /// The replay entries for all cars in this frame.
 fn capture_cars() -> Vec<SkaterState> {
     let mut out = Vec::new();
-    for obj in car_objects(false) {
+    let objects = car_objects(false);
+    check_ids(&objects);
+    for obj in objects {
         let Some((addr, bones)) = car_pose_buffer(obj) else {
             continue;
         };
@@ -724,8 +820,16 @@ fn capture_cars() -> Vec<SkaterState> {
             continue;
         };
         orthonormalize(&mut matrix);
-        let (hi, lo) = key_floats(car_key(obj));
-        matrix[3] = CAR_MARK;
+        let (mark, key) = match object_id(obj) {
+            Some(id) => {
+                let kind = kind_of(obj);
+                let mark = CAR_ID_MARKS.iter().find(|(_, k)| *k == kind).unwrap().0;
+                (mark, id)
+            }
+            None => (CAR_MARK, car_key(obj)),
+        };
+        let (hi, lo) = key_floats(key);
+        matrix[3] = mark;
         matrix[7] = hi;
         matrix[11] = lo;
         let mut state = SkaterState {
@@ -754,7 +858,7 @@ fn capture_cars() -> Vec<SkaterState> {
 }
 
 /// The recorded cars of a frame (entries after the skater's).
-fn car_entries(f: &ReplayState) -> impl Iterator<Item = (u32, &SkaterState)> {
+fn car_entries(f: &ReplayState) -> impl Iterator<Item = (CarKey, &SkaterState)> {
     f.skaters
         .iter()
         .skip(3)
@@ -786,7 +890,7 @@ fn car_bone_matrix(s: &SkaterState, b: usize) -> [f32; 16] {
 
 /// The cars between two recorded frames, matched by key (a car only in `a` stays as it was).
 fn blend_cars(a: &ReplayState, b: &ReplayState, t: f32) -> Vec<SkaterState> {
-    let later: Vec<(u32, &SkaterState)> = car_entries(b).collect();
+    let later: Vec<(CarKey, &SkaterState)> = car_entries(b).collect();
     car_entries(a)
         .map(|(key, ca)| {
             let Some((_, cb)) = later.iter().find(|(k, _)| *k == key) else {
@@ -827,11 +931,113 @@ fn blend_cars(a: &ReplayState, b: &ReplayState, t: f32) -> Vec<SkaterState> {
         .collect()
 }
 
+/// A live object recorded cars can be played on.
+struct LiveCar {
+    obj: usize,
+    buffer: usize,
+    bones: usize,
+    id: Option<u32>,
+    kind: Kind,
+    pos: [f32; 3],
+}
+
+/// Recorded cars played on live objects found by position (see the section comment), kept
+/// while the replay plays.
+static STAND_INS: Mutex<Option<(Instant, Vec<(CarKey, usize)>)>> = Mutex::new(None);
+/// A replay that hasn't played for this long has stopped: its stand-ins are chosen afresh.
+const STAND_IN_FORGET_MS: u128 = 1000;
+
+/// Which live object each recorded car is played on (indices into `live`).
+fn match_cars(
+    cars: &[(CarKey, usize, [f32; 3])],
+    live: &[LiveCar],
+) -> (Vec<Option<usize>>, usize, usize) {
+    let mut taken = vec![false; live.len()];
+    let mut shown_on: Vec<Option<usize>> = vec![None; cars.len()];
+    let mut exact = 0;
+    // Its own object: the same id (any session), or the same address and skeleton (the
+    // same session, for replays from before ids).
+    for (i, (key, bones, _)) in cars.iter().enumerate() {
+        let found = live.iter().enumerate().position(|(j, l)| {
+            !taken[j]
+                && match key {
+                    CarKey::Id(id, kind) => l.id == Some(*id) && l.kind == *kind,
+                    CarKey::Address(a) => car_key(l.obj) == *a && l.bones == *bones,
+                }
+        });
+        if let Some(j) = found {
+            taken[j] = true;
+            shown_on[i] = Some(j);
+            exact += 1;
+        }
+    }
+    // The rest: the object it was played on before, or the nearest free one of its kind with
+    // the same skeleton.
+    let mut guard = STAND_INS.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = guard
+        .as_ref()
+        .is_none_or(|(t, _)| t.elapsed().as_millis() > STAND_IN_FORGET_MS);
+    let mut stand_ins = if fresh {
+        Vec::new()
+    } else {
+        guard.take().map(|(_, s)| s).unwrap_or_default()
+    };
+    stand_ins.retain(|(key, _)| {
+        cars.iter()
+            .enumerate()
+            .any(|(i, c)| c.0 == *key && shown_on[i].is_none())
+    });
+    let fits = |key: &CarKey, bones: usize, l: &LiveCar| {
+        l.bones == bones
+            && match key {
+                CarKey::Id(_, kind) => l.kind == *kind,
+                CarKey::Address(_) => true,
+            }
+    };
+    let mut stood_in = 0;
+    for (i, (key, bones, pos)) in cars.iter().enumerate() {
+        if shown_on[i].is_some() {
+            continue;
+        }
+        let before = stand_ins
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, obj)| {
+                live.iter()
+                    .position(|l| l.obj == *obj)
+                    .filter(|j| !taken[*j] && fits(key, *bones, &live[*j]))
+            });
+        let j = before.or_else(|| {
+            live.iter()
+                .enumerate()
+                .filter(|(j, l)| !taken[*j] && fits(key, *bones, l))
+                .min_by(|(_, a), (_, b)| {
+                    let d = |p: [f32; 3]| {
+                        let d: [f32; 3] = std::array::from_fn(|c| p[c] - pos[c]);
+                        dot3(d, d)
+                    };
+                    d(a.pos).total_cmp(&d(b.pos))
+                })
+                .map(|(j, _)| j)
+        });
+        if let Some(j) = j {
+            taken[j] = true;
+            shown_on[i] = Some(j);
+            stood_in += 1;
+            stand_ins.retain(|(k, _)| k != key);
+            stand_ins.push((*key, live[j].obj));
+        }
+    }
+    *guard = Some((Instant::now(), stand_ins));
+    (shown_on, exact, stood_in)
+}
+
 /// Called from `apply_frame` in the freecam: hands the recorded cars to the commit hook.
 fn play_cars(frame: &ReplayState) {
-    let cars: Vec<CarFrame> = car_entries(frame)
-        .map(|(key, s)| CarFrame {
-            key,
+    let entries: Vec<(CarKey, &SkaterState)> = car_entries(frame).collect();
+    let cars: Vec<CarFrame> = entries
+        .iter()
+        .map(|(_, s)| CarFrame {
             pos: s.world_pos,
             rows: rotation_rows(&{
                 let mut m = s.world_matrix;
@@ -843,19 +1049,36 @@ fn play_cars(frame: &ReplayState) {
             bones: (0..s.bones()).map(|b| car_bone_matrix(s, b)).collect(),
         })
         .collect();
-    let live: Vec<(usize, u32, Kind)> = car_objects(true)
+    let objects = car_objects(true);
+    check_ids(&objects);
+    let live: Vec<LiveCar> = objects
         .into_iter()
-        .filter_map(|o| car_pose_buffer(o).map(|(a, _)| (a, car_key(o), kind_of(o))))
+        .filter_map(|obj| {
+            let (buffer, bones) = car_pose_buffer(obj)?;
+            Some(LiveCar {
+                obj,
+                buffer,
+                bones,
+                id: object_id(obj),
+                kind: kind_of(obj),
+                pos: read3(obj + OBJ_POSITION)?,
+            })
+        })
+        .collect();
+    let wanted: Vec<(CarKey, usize, [f32; 3])> = entries
+        .iter()
+        .map(|(k, s)| (*k, s.bones(), s.world_pos))
+        .collect();
+    let (shown_on, exact, stood_in) = match_cars(&wanted, &live);
+    let buffers: Vec<(usize, Option<usize>, Kind)> = live
+        .iter()
+        .enumerate()
+        .map(|(j, l)| (l.buffer, shown_on.iter().position(|s| *s == Some(j)), l.kind))
         .collect();
     if CAR_LOGS.fetch_add(1, Ordering::Relaxed) % 600 == 0 {
         let count = |kind: Kind| {
-            let l: Vec<_> = live.iter().filter(|x| x.2 == kind).collect();
-            (
-                l.len(),
-                l.iter()
-                    .filter(|(_, k, _)| cars.iter().any(|c| c.key == *k))
-                    .count(),
-            )
+            let l: Vec<_> = buffers.iter().filter(|x| x.2 == kind).collect();
+            (l.len(), l.iter().filter(|(_, c, _)| c.is_some()).count())
         };
         let ((c, cm), (p, pm), (o, om)) = (
             count(Kind::Car),
@@ -863,40 +1086,37 @@ fn play_cars(frame: &ReplayState) {
             count(Kind::Other),
         );
         log::info!(
-            "[THAW] traffic replay: {} recorded in this frame; cars: {c} live, {cm} recorded; pedestrians: {p} live, {pm} recorded; other: {o} live, {om} recorded",
+            "[THAW] traffic replay: {} recorded in this frame, {exact} on their own object, {stood_in} on a stand-in; cars: {c} live, {cm} played; pedestrians: {p} live, {pm} played; other: {o} live, {om} played",
             cars.len()
         );
     }
-    *CAR_BUFFERS.lock().unwrap_or_else(|e| e.into_inner()) = live;
-    *PLAYED_CARS.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), cars));
+    *PLAYED_CARS.lock().unwrap_or_else(|e| e.into_inner()) = Some(Played {
+        stamp: Instant::now(),
+        cars,
+        buffers,
+    });
 }
 
 /// In the commit hook: draws a live car as its recorded self (or hides it).
 fn replace_car(world: u32, src: usize, count: u32) {
-    let (key, kind) = {
-        let Ok(bufs) = CAR_BUFFERS.try_lock() else {
-            return;
-        };
-        let Some((_, key, kind)) = bufs.iter().find(|(a, _, _)| *a == src) else {
-            return;
-        };
-        (*key, *kind)
-    };
     let Ok(played) = PLAYED_CARS.try_lock() else {
         return;
     };
-    let Some((stamp, cars)) = played.as_ref() else {
+    let Some(played) = played.as_ref() else {
         return;
     };
     // Recordings made before cars were recorded leave the traffic alone.
-    if stamp.elapsed().as_millis() > 150 || cars.is_empty() {
+    if played.stamp.elapsed().as_millis() > 150 || played.cars.is_empty() {
         return;
     }
+    let Some((_, shown, kind)) = played.buffers.iter().find(|(a, _, _)| *a == src) else {
+        return;
+    };
     let given = floats(&read_block(world as usize, 64));
     if given.len() != 16 {
         return;
     }
-    match cars.iter().find(|c| c.key == key) {
+    match shown.and_then(|i| played.cars.get(i)) {
         Some(car) => {
             let n = (count as usize).min(car.bones.len());
             write_matrices(src, &car.bones, n);
@@ -911,7 +1131,7 @@ fn replace_car(world: u32, src: usize, count: u32) {
         }
         // Only cars are hidden: pedestrians and other objects that were not recorded (too
         // far away then) keep moving as they are.
-        None if kind == Kind::Car => {
+        None if *kind == Kind::Car => {
             write::<f32>(world as usize + 13 * 4, given[13] - HIDE_DEPTH);
         }
         None => {}
